@@ -3,8 +3,8 @@
 ## System Initialization Flow
 1.  **App Launch:** Flutter app initializes and displays the Initialization screen with progress indicator.
 2.  **Sensor Check:** App verifies that all physical sensors are online and responding.
-3.  **Cloud Connection:** App establishes connection to Supabase and Next.js backend, displaying "CLOUD LINKED" status.
-4.  **Configuration Load:** App fetches device configuration, current status, and sensor readings from the backend.
+3.  **Cloud Connection:** App establishes direct connection to Supabase (Auth, Database, Realtime), displaying "CLOUD LINKED" status.
+4.  **Configuration Load:** App fetches device configuration, current status, and sensor readings directly from Supabase.
 5.  **Home Screen Ready:** Once initialized (100%), app transitions to the Home screen.
 
 ## Dual-Layer Protection Flow
