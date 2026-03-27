@@ -1,7 +1,10 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
   runApp(const AegisDryApp());
@@ -55,6 +58,772 @@ class AppColors {
   static const Color success = Color(0xFF22B573);
 }
 
+class AppLocation {
+  const AppLocation({
+    required this.label,
+    required this.latitude,
+    required this.longitude,
+    this.street,
+    this.province,
+    this.city,
+  });
+
+  final String label;
+  final double latitude;
+  final double longitude;
+  final String? street;
+  final String? province;
+  final String? city;
+}
+
+class LocationStore {
+  static const String _labelKey = 'user.location.label';
+  static const String _latKey = 'user.location.lat';
+  static const String _lonKey = 'user.location.lon';
+  static const String _streetKey = 'user.location.street';
+  static const String _provinceKey = 'user.location.province';
+  static const String _cityKey = 'user.location.city';
+
+  static Future<AppLocation?> load() async {
+    final prefs = await SharedPreferences.getInstance();
+    final label = prefs.getString(_labelKey);
+    final lat = prefs.getDouble(_latKey);
+    final lon = prefs.getDouble(_lonKey);
+    if (label == null || lat == null || lon == null) {
+      return null;
+    }
+    return AppLocation(
+      label: label,
+      latitude: lat,
+      longitude: lon,
+      street: prefs.getString(_streetKey),
+      province: prefs.getString(_provinceKey),
+      city: prefs.getString(_cityKey),
+    );
+  }
+
+  static Future<void> save(AppLocation location) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_labelKey, location.label);
+    await prefs.setDouble(_latKey, location.latitude);
+    await prefs.setDouble(_lonKey, location.longitude);
+    if (location.street == null || location.street!.isEmpty) {
+      await prefs.remove(_streetKey);
+    } else {
+      await prefs.setString(_streetKey, location.street!);
+    }
+    if (location.province == null || location.province!.isEmpty) {
+      await prefs.remove(_provinceKey);
+    } else {
+      await prefs.setString(_provinceKey, location.province!);
+    }
+    if (location.city == null || location.city!.isEmpty) {
+      await prefs.remove(_cityKey);
+    } else {
+      await prefs.setString(_cityKey, location.city!);
+    }
+  }
+}
+
+class _PhProvinceOption {
+  const _PhProvinceOption({required this.code, required this.name});
+
+  final String code;
+  final String name;
+}
+
+class _PhMunicipalityOption {
+  const _PhMunicipalityOption({
+    required this.displayName,
+    required this.queryName,
+  });
+
+  final String displayName;
+  final String queryName;
+}
+
+class _PhilippinesLocationService {
+  static const String _psgcHost = 'psgc.gitlab.io';
+  static const String _metroManilaCode = 'NCR';
+  static const String _metroManilaName = 'Metro Manila';
+  static const String _ncrRegionCode = '130000000';
+
+  static List<_PhProvinceOption>? _provinceCache;
+  static List<Map<String, dynamic>>? _municipalityCache;
+
+  static Future<List<_PhProvinceOption>> fetchProvinces() async {
+    final cached = _provinceCache;
+    if (cached != null) {
+      return cached;
+    }
+
+    final uri = Uri.https(_psgcHost, '/api/provinces/');
+    final response = await http.get(uri);
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw StateError(
+        'Failed to load provinces from PSGC (${response.statusCode}).',
+      );
+    }
+
+    final decoded = jsonDecode(response.body);
+    if (decoded is! List<dynamic>) {
+      throw StateError('Invalid provinces payload from PSGC.');
+    }
+
+    final provinces = <_PhProvinceOption>[
+      const _PhProvinceOption(code: _metroManilaCode, name: _metroManilaName),
+    ];
+
+    for (final item in decoded) {
+      if (item is! Map) {
+        continue;
+      }
+      final row = item.map((key, value) => MapEntry(key.toString(), value));
+      final code = _readString(row, 'code');
+      final name = _readString(row, 'name');
+      if (code == null || name == null) {
+        continue;
+      }
+      provinces.add(_PhProvinceOption(code: code, name: name));
+    }
+
+    provinces.sort(
+      (a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()),
+    );
+    _provinceCache = List<_PhProvinceOption>.unmodifiable(provinces);
+    return _provinceCache!;
+  }
+
+  static Future<List<_PhMunicipalityOption>> fetchMunicipalities({
+    required String provinceCode,
+  }) async {
+    final rows = await _fetchAllMunicipalities();
+    final optionsByKey = <String, _PhMunicipalityOption>{};
+
+    for (final row in rows) {
+      final regionCode = _readString(row, 'regionCode');
+      final rowProvinceCode = _readString(row, 'provinceCode');
+
+      final belongsToProvince = provinceCode == _metroManilaCode
+          ? regionCode == _ncrRegionCode
+          : rowProvinceCode == provinceCode;
+      if (!belongsToProvince) {
+        continue;
+      }
+
+      final rawName = _readString(row, 'name');
+      if (rawName == null) {
+        continue;
+      }
+      final normalizedName = _normalizeMunicipalityName(rawName);
+      final key = normalizedName.toLowerCase();
+      optionsByKey[key] = _PhMunicipalityOption(
+        displayName: normalizedName,
+        queryName: normalizedName,
+      );
+    }
+
+    final options = optionsByKey.values.toList()
+      ..sort(
+        (a, b) =>
+            a.displayName.toLowerCase().compareTo(b.displayName.toLowerCase()),
+      );
+    return options;
+  }
+
+  static Future<List<Map<String, dynamic>>> _fetchAllMunicipalities() async {
+    final cached = _municipalityCache;
+    if (cached != null) {
+      return cached;
+    }
+
+    final uri = Uri.https(_psgcHost, '/api/cities-municipalities/');
+    final response = await http.get(uri);
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw StateError(
+        'Failed to load municipalities from PSGC (${response.statusCode}).',
+      );
+    }
+
+    final decoded = jsonDecode(response.body);
+    if (decoded is! List<dynamic>) {
+      throw StateError('Invalid municipalities payload from PSGC.');
+    }
+
+    final rows = <Map<String, dynamic>>[];
+    for (final item in decoded) {
+      if (item is! Map) {
+        continue;
+      }
+      rows.add(item.map((key, value) => MapEntry(key.toString(), value)));
+    }
+
+    _municipalityCache = List<Map<String, dynamic>>.unmodifiable(rows);
+    return _municipalityCache!;
+  }
+
+  static String? _readString(Map<String, dynamic> row, String key) {
+    final value = row[key];
+    if (value == null || value == false) {
+      return null;
+    }
+    final text = value.toString().trim();
+    if (text.isEmpty || text.toLowerCase() == 'false') {
+      return null;
+    }
+    return text;
+  }
+
+  static String _normalizeMunicipalityName(String name) {
+    final cityPrefix = RegExp(r'^City of\s+', caseSensitive: false);
+    return name.replaceFirst(cityPrefix, '').trim();
+  }
+}
+
+class AppAccount {
+  const AppAccount({
+    required this.username,
+    required this.email,
+    required this.password,
+  });
+
+  final String username;
+  final String email;
+  final String password;
+
+  Map<String, dynamic> toJson() {
+    return <String, dynamic>{
+      'username': username,
+      'email': email,
+      'password': password,
+    };
+  }
+
+  static AppAccount fromJson(Map<String, dynamic> json) {
+    return AppAccount(
+      username: json['username']?.toString() ?? '',
+      email: json['email']?.toString() ?? '',
+      password: json['password']?.toString() ?? '',
+    );
+  }
+}
+
+class AccountStore {
+  static const String _accountsKey = 'user.accounts.v1';
+
+  static Future<List<AppAccount>> load() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_accountsKey);
+    if (raw == null || raw.isEmpty) {
+      return const <AppAccount>[];
+    }
+
+    final decoded = jsonDecode(raw);
+    if (decoded is! List<dynamic>) {
+      return const <AppAccount>[];
+    }
+
+    return decoded
+        .whereType<Map<String, dynamic>>()
+        .map(AppAccount.fromJson)
+        .toList();
+  }
+
+  static Future<bool> usernameExists(String username) async {
+    final normalized = username.trim().toLowerCase();
+    final accounts = await load();
+    return accounts.any(
+      (account) => account.username.toLowerCase() == normalized,
+    );
+  }
+
+  static Future<bool> emailExists(String email) async {
+    final normalized = email.trim().toLowerCase();
+    final accounts = await load();
+    return accounts.any((account) => account.email.toLowerCase() == normalized);
+  }
+
+  static Future<bool> validate(String username, String password) async {
+    final normalized = username.trim().toLowerCase();
+    final accounts = await load();
+    return accounts.any(
+      (account) =>
+          account.username.toLowerCase() == normalized &&
+          account.password == password,
+    );
+  }
+
+  static Future<bool> save(AppAccount account) async {
+    final prefs = await SharedPreferences.getInstance();
+    final existing = await load();
+    final duplicateUsername = existing.any(
+      (item) => item.username.toLowerCase() == account.username.toLowerCase(),
+    );
+    final duplicateEmail = existing.any(
+      (item) => item.email.toLowerCase() == account.email.toLowerCase(),
+    );
+    if (duplicateUsername || duplicateEmail) {
+      return false;
+    }
+
+    final updated = <AppAccount>[...existing, account];
+    final payload = jsonEncode(updated.map((item) => item.toJson()).toList());
+    return prefs.setString(_accountsKey, payload);
+  }
+}
+
+class WeatherSnapshot {
+  const WeatherSnapshot({
+    required this.temperatureC,
+    required this.sky,
+    required this.humidity,
+    required this.rainProbability,
+    required this.source,
+  });
+
+  final double temperatureC;
+  final String sky;
+  final int humidity;
+  final int rainProbability;
+  final String source;
+
+  String get temperatureFText => '${((temperatureC * 9 / 5) + 32).round()}°F';
+}
+
+class OpenWeatherService {
+  static const String _apiKey = String.fromEnvironment(
+    'OPENWEATHERMAP_API_KEY',
+  );
+
+  static Future<(double, double)> geocodePhilippineLocation({
+    required String municipality,
+    required String province,
+  }) async {
+    final queries = <String>[
+      '$municipality, $province, Philippines',
+      '$municipality, Philippines',
+      municipality,
+    ];
+
+    for (final query in queries) {
+      final result = await _resolveCoordinatesOpenMeteo(
+        query: query,
+        provinceHint: province,
+      );
+      if (result != null) {
+        return result;
+      }
+    }
+
+    for (final query in queries) {
+      final result = await _resolveCoordinatesNominatim(
+        query: query,
+        provinceHint: province,
+      );
+      if (result != null) {
+        return result;
+      }
+    }
+
+    throw StateError(
+      'No geocoding result for "$municipality, $province, Philippines".',
+    );
+  }
+
+  static Future<(double, double)?> _resolveCoordinatesOpenMeteo({
+    required String query,
+    required String provinceHint,
+  }) async {
+    final geoUri = Uri.https('geocoding-api.open-meteo.com', '/v1/search', {
+      'name': query,
+      'count': '10',
+      'language': 'en',
+      'format': 'json',
+    });
+
+    final response = await http.get(geoUri);
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw StateError('Failed geocoding lookup (${response.statusCode}).');
+    }
+
+    final decoded = jsonDecode(response.body);
+    if (decoded is! Map<String, dynamic>) {
+      return null;
+    }
+
+    final results = decoded['results'];
+    if (results is! List<dynamic> || results.isEmpty) {
+      return null;
+    }
+
+    final normalizedProvince = provinceHint.trim().toLowerCase();
+    (double, double)? firstMatch;
+
+    for (final item in results) {
+      if (item is! Map) {
+        continue;
+      }
+
+      final row = item.map((key, value) => MapEntry(key.toString(), value));
+      final countryCode = row['country_code']?.toString().toUpperCase();
+      if (countryCode != 'PH') {
+        continue;
+      }
+
+      final lat = (row['latitude'] as num?)?.toDouble();
+      final lon = (row['longitude'] as num?)?.toDouble();
+      if (lat == null || lon == null) {
+        continue;
+      }
+
+      firstMatch ??= (lat, lon);
+
+      final admin1 = row['admin1']?.toString().toLowerCase() ?? '';
+      final admin2 = row['admin2']?.toString().toLowerCase() ?? '';
+      if (normalizedProvince.isNotEmpty &&
+          (admin1.contains(normalizedProvince) ||
+              admin2.contains(normalizedProvince))) {
+        return (lat, lon);
+      }
+    }
+
+    return firstMatch;
+  }
+
+  static Future<(double, double)?> _resolveCoordinatesNominatim({
+    required String query,
+    required String provinceHint,
+  }) async {
+    final geoUri = Uri.https('nominatim.openstreetmap.org', '/search', {
+      'q': query,
+      'format': 'jsonv2',
+      'countrycodes': 'ph',
+      'addressdetails': '1',
+      'limit': '5',
+    });
+
+    final response = await http.get(
+      geoUri,
+      headers: <String, String>{
+        'User-Agent': 'aegis-dry-mobile/1.0 (location-setup)',
+      },
+    );
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw StateError(
+        'Failed geocoding fallback lookup (${response.statusCode}).',
+      );
+    }
+
+    final decoded = jsonDecode(response.body);
+    if (decoded is! List<dynamic> || decoded.isEmpty) {
+      return null;
+    }
+
+    final normalizedProvince = provinceHint.trim().toLowerCase();
+    (double, double)? firstMatch;
+
+    for (final item in decoded) {
+      if (item is! Map) {
+        continue;
+      }
+
+      final row = item.map((key, value) => MapEntry(key.toString(), value));
+      final lat = double.tryParse(row['lat']?.toString() ?? '');
+      final lon = double.tryParse(row['lon']?.toString() ?? '');
+      if (lat == null || lon == null) {
+        continue;
+      }
+
+      firstMatch ??= (lat, lon);
+
+      final display = row['display_name']?.toString().toLowerCase() ?? '';
+      if (normalizedProvince.isNotEmpty &&
+          display.contains(normalizedProvince)) {
+        return (lat, lon);
+      }
+    }
+
+    return firstMatch;
+  }
+
+  static Future<WeatherSnapshot> getSnapshot({
+    required double latitude,
+    required double longitude,
+  }) async {
+    if (_apiKey.isNotEmpty) {
+      try {
+        return await _getSnapshotFromOpenWeather(
+          latitude: latitude,
+          longitude: longitude,
+        );
+      } catch (_) {
+        // Fallback below keeps forecast mode operational when OpenWeather is unavailable.
+      }
+    }
+
+    return _getSnapshotFromOpenMeteo(latitude: latitude, longitude: longitude);
+  }
+
+  static Future<WeatherSnapshot> _getSnapshotFromOpenWeather({
+    required double latitude,
+    required double longitude,
+  }) async {
+    final weatherUri =
+        Uri.https('api.openweathermap.org', '/data/2.5/weather', {
+          'lat': latitude.toString(),
+          'lon': longitude.toString(),
+          'appid': _apiKey,
+          'units': 'metric',
+        });
+
+    final forecastUri =
+        Uri.https('api.openweathermap.org', '/data/2.5/forecast', {
+          'lat': latitude.toString(),
+          'lon': longitude.toString(),
+          'appid': _apiKey,
+          'units': 'metric',
+        });
+
+    final responses = await Future.wait([
+      http.get(weatherUri),
+      http.get(forecastUri),
+    ]);
+
+    final weatherRes = responses[0];
+    final forecastRes = responses[1];
+
+    if (weatherRes.statusCode < 200 || weatherRes.statusCode >= 300) {
+      throw StateError('Failed weather lookup (${weatherRes.statusCode}).');
+    }
+    if (forecastRes.statusCode < 200 || forecastRes.statusCode >= 300) {
+      throw StateError(
+        'Failed rain forecast lookup (${forecastRes.statusCode}).',
+      );
+    }
+
+    final weatherJson = jsonDecode(weatherRes.body) as Map<String, dynamic>;
+    final forecastJson = jsonDecode(forecastRes.body) as Map<String, dynamic>;
+
+    final temp = (weatherJson['main']?['temp'] as num?)?.toDouble() ?? 0;
+    final humidity = (weatherJson['main']?['humidity'] as num?)?.toInt() ?? 0;
+    final weatherList =
+        (weatherJson['weather'] as List<dynamic>?)
+            ?.cast<Map<String, dynamic>>() ??
+        const <Map<String, dynamic>>[];
+    final sky = weatherList.isNotEmpty
+        ? weatherList.first['main']?.toString() ?? 'Unknown'
+        : 'Unknown';
+
+    final forecastList =
+        (forecastJson['list'] as List<dynamic>?)
+            ?.cast<Map<String, dynamic>>() ??
+        const <Map<String, dynamic>>[];
+    final firstForecast = forecastList.isNotEmpty ? forecastList.first : null;
+    final rainPop = ((firstForecast?['pop'] as num?)?.toDouble() ?? 0) * 100;
+
+    return WeatherSnapshot(
+      temperatureC: temp,
+      sky: sky,
+      humidity: humidity,
+      rainProbability: rainPop.round().clamp(0, 100),
+      source: 'OpenWeather',
+    );
+  }
+
+  static Future<WeatherSnapshot> _getSnapshotFromOpenMeteo({
+    required double latitude,
+    required double longitude,
+  }) async {
+    final uri = Uri.https('api.open-meteo.com', '/v1/forecast', {
+      'latitude': latitude.toString(),
+      'longitude': longitude.toString(),
+      'current': 'temperature_2m,relative_humidity_2m,weather_code',
+      'hourly': 'precipitation_probability',
+      'forecast_days': '1',
+      'timezone': 'auto',
+    });
+
+    final response = await http.get(uri);
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw StateError(
+        'Weather providers unavailable (${response.statusCode}). Please check internet and try again.',
+      );
+    }
+
+    final decoded = jsonDecode(response.body);
+    if (decoded is! Map<String, dynamic>) {
+      throw StateError('Invalid weather payload from fallback provider.');
+    }
+
+    final current = decoded['current'];
+    if (current is! Map<String, dynamic>) {
+      throw StateError('Missing current weather data from fallback provider.');
+    }
+
+    final temperatureC = (current['temperature_2m'] as num?)?.toDouble() ?? 0;
+    final humidity = (current['relative_humidity_2m'] as num?)?.toInt() ?? 0;
+    final weatherCode = (current['weather_code'] as num?)?.toInt() ?? 0;
+    final sky = _weatherCodeToSky(weatherCode);
+
+    final hourly = decoded['hourly'];
+    int rainProbability = 0;
+    if (hourly is Map<String, dynamic>) {
+      final pops = hourly['precipitation_probability'];
+      if (pops is List<dynamic> && pops.isNotEmpty) {
+        final first = pops.first;
+        final parsed = first is num ? first.toInt() : int.tryParse('$first');
+        rainProbability = (parsed ?? 0).clamp(0, 100);
+      }
+    }
+
+    return WeatherSnapshot(
+      temperatureC: temperatureC,
+      sky: sky,
+      humidity: humidity,
+      rainProbability: rainProbability,
+      source: 'Open-Meteo',
+    );
+  }
+
+  static String _weatherCodeToSky(int code) {
+    if (code == 0) {
+      return 'Clear';
+    }
+    if (code == 1 || code == 2 || code == 3) {
+      return 'Cloudy';
+    }
+    if (code == 45 || code == 48) {
+      return 'Fog';
+    }
+    if (code == 51 || code == 53 || code == 55 || code == 56 || code == 57) {
+      return 'Drizzle';
+    }
+    if (code == 61 ||
+        code == 63 ||
+        code == 65 ||
+        code == 66 ||
+        code == 67 ||
+        code == 80 ||
+        code == 81 ||
+        code == 82) {
+      return 'Rain';
+    }
+    if (code == 71 ||
+        code == 73 ||
+        code == 75 ||
+        code == 77 ||
+        code == 85 ||
+        code == 86) {
+      return 'Snow';
+    }
+    if (code == 95 || code == 96 || code == 99) {
+      return 'Storm';
+    }
+    return 'Unknown';
+  }
+}
+
+class ActivityFeedEvent {
+  const ActivityFeedEvent({
+    required this.icon,
+    required this.title,
+    required this.subtitle,
+    required this.response,
+    required this.timestamp,
+    this.isMuted = false,
+  });
+
+  final IconData icon;
+  final String title;
+  final String subtitle;
+  final String response;
+  final DateTime timestamp;
+  final bool isMuted;
+}
+
+List<ActivityFeedEvent> buildRecentActivityFeed({
+  required AppLocation location,
+  required WeatherSnapshot? weather,
+  required DateTime? lastWeatherSyncAt,
+}) {
+  final now = DateTime.now();
+  final syncAt = lastWeatherSyncAt ?? now.subtract(const Duration(minutes: 1));
+  final cityLabel = location.city ?? location.label;
+  final provinceLabel = location.province ?? 'Philippines';
+
+  if (weather == null) {
+    return <ActivityFeedEvent>[
+      ActivityFeedEvent(
+        icon: Icons.sync_problem,
+        title: 'Weather Sync Pending',
+        subtitle: 'Waiting for forecast data for $cityLabel.',
+        response:
+            'User activity processing is active and will evaluate rain risk once weather sync completes.',
+        timestamp: syncAt,
+      ),
+      ActivityFeedEvent(
+        icon: Icons.location_on_outlined,
+        title: 'Location Profile Loaded',
+        subtitle: 'Monitoring area set to $provinceLabel.',
+        response:
+            'Forecast jobs are queued for ${location.latitude.toStringAsFixed(4)}, ${location.longitude.toStringAsFixed(4)}.',
+        timestamp: now.subtract(const Duration(minutes: 8)),
+      ),
+      ActivityFeedEvent(
+        icon: Icons.cloud_upload_outlined,
+        title: 'Cloud Activity Queue Ready',
+        subtitle:
+            'Event stream is prepared for user actions and weather updates.',
+        response:
+            'System is in forecast-only mode while hardware integration is in progress.',
+        timestamp: now.subtract(const Duration(hours: 1)),
+        isMuted: true,
+      ),
+    ];
+  }
+
+  final rainLevel = weather.rainProbability >= 60
+      ? 'HIGH'
+      : (weather.rainProbability >= 40 ? 'MODERATE' : 'LOW');
+
+  return <ActivityFeedEvent>[
+    ActivityFeedEvent(
+      icon: Icons.cloud_done_outlined,
+      title: 'Weather Sync Complete',
+      subtitle:
+          '${weather.source} feed: ${weather.temperatureC.round()}°C, ${weather.humidity}% humidity, ${weather.rainProbability}% rain chance.',
+      response:
+          'Latest forecast snapshot was processed and appended to user activity records.',
+      timestamp: syncAt,
+    ),
+    ActivityFeedEvent(
+      icon: Icons.analytics_outlined,
+      title: 'Rain Risk Evaluated',
+      subtitle: '$rainLevel risk level for $provinceLabel.',
+      response: weather.rainProbability >= 60
+          ? 'Auto-retract condition flagged for deployment once hardware is connected.'
+          : 'No retract action required under current forecast conditions.',
+      timestamp: syncAt.subtract(const Duration(minutes: 7)),
+    ),
+    ActivityFeedEvent(
+      icon: Icons.location_on_outlined,
+      title: 'Location-Aware Processing',
+      subtitle: 'Forecast checks are pinned to $cityLabel.',
+      response:
+          'Weather and user activity pipelines remain synchronized for this configured location.',
+      timestamp: syncAt.subtract(const Duration(minutes: 19)),
+    ),
+    ActivityFeedEvent(
+      icon: Icons.restore,
+      title: 'Routine Backup',
+      subtitle: 'User activity and weather summaries were archived.',
+      response: 'Cloud backup completed with no conflicts.',
+      timestamp: now.subtract(const Duration(days: 1)),
+      isMuted: true,
+    ),
+  ];
+}
+
 double responsiveScale(BuildContext context) {
   final width = MediaQuery.sizeOf(context).width;
   return (width / 390).clamp(0.78, 1.0);
@@ -62,6 +831,57 @@ double responsiveScale(BuildContext context) {
 
 double rs(BuildContext context, double size, {double min = 12}) {
   return math.max(min, size * responsiveScale(context));
+}
+
+String _twoDigits(int value) => value.toString().padLeft(2, '0');
+
+String formatClockTime(DateTime time) {
+  final hour = time.hour % 12 == 0 ? 12 : time.hour % 12;
+  final meridian = time.hour >= 12 ? 'PM' : 'AM';
+  return '$hour:${_twoDigits(time.minute)} $meridian';
+}
+
+String formatRelativeTime(DateTime? time) {
+  if (time == null) {
+    return 'No weather sync yet';
+  }
+  final diff = DateTime.now().difference(time);
+  if (diff.inSeconds < 30) {
+    return 'Last checked: just now';
+  }
+  if (diff.inMinutes < 60) {
+    return 'Last checked: ${diff.inMinutes} minute${diff.inMinutes == 1 ? '' : 's'} ago';
+  }
+  if (diff.inHours < 24) {
+    return 'Last checked: ${diff.inHours} hour${diff.inHours == 1 ? '' : 's'} ago';
+  }
+  return 'Last checked: ${diff.inDays} day${diff.inDays == 1 ? '' : 's'} ago';
+}
+
+String formatDayDate(DateTime time) {
+  const months = <String>[
+    'JAN',
+    'FEB',
+    'MAR',
+    'APR',
+    'MAY',
+    'JUN',
+    'JUL',
+    'AUG',
+    'SEP',
+    'OCT',
+    'NOV',
+    'DEC',
+  ];
+  return '${months[time.month - 1]} ${time.day}, ${time.year}';
+}
+
+String formatActivityTime(DateTime time) {
+  final diff = DateTime.now().difference(time);
+  if (diff.inHours < 24) {
+    return formatClockTime(time);
+  }
+  return formatDayDate(time);
 }
 
 class AppViewport extends StatelessWidget {
@@ -324,7 +1144,10 @@ class _LoginScreenState extends State<LoginScreen> {
           child: SafeArea(
             child: Center(
               child: SingleChildScrollView(
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 18),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 18,
+                ),
                 child: Container(
                   width: double.infinity,
                   padding: const EdgeInsets.fromLTRB(20, 20, 20, 14),
@@ -427,10 +1250,14 @@ class _LoginScreenState extends State<LoginScreen> {
                         obscure: _obscurePassword,
                         suffix: IconButton(
                           onPressed: () {
-                            setState(() => _obscurePassword = !_obscurePassword);
+                            setState(
+                              () => _obscurePassword = !_obscurePassword,
+                            );
                           },
                           icon: Icon(
-                            _obscurePassword ? Icons.visibility_outlined : Icons.visibility_off_outlined,
+                            _obscurePassword
+                                ? Icons.visibility_outlined
+                                : Icons.visibility_off_outlined,
                             size: 18,
                             color: const Color(0xFF8C9BB2),
                           ),
@@ -454,7 +1281,7 @@ class _LoginScreenState extends State<LoginScreen> {
                       ),
                       const SizedBox(height: 8),
                       FilledButton(
-                        onPressed: _onLogin,
+                        onPressed: () => _onLogin(),
                         style: FilledButton.styleFrom(
                           minimumSize: const Size(double.infinity, 48),
                           backgroundColor: AppColors.primary,
@@ -473,11 +1300,25 @@ class _LoginScreenState extends State<LoginScreen> {
                       const SizedBox(height: 12),
                       Row(
                         mainAxisAlignment: MainAxisAlignment.center,
-                        children: const [
-                          Text('New to Aegis-Dry? ', style: TextStyle(color: Color(0xFF8A98AE))),
-                          Text(
-                            'Create an account',
-                            style: TextStyle(color: AppColors.primary, fontWeight: FontWeight.w700),
+                        children: [
+                          const Text(
+                            'New to Aegis-Dry? ',
+                            style: TextStyle(color: Color(0xFF8A98AE)),
+                          ),
+                          TextButton(
+                            onPressed: _openRegisterScreen,
+                            style: TextButton.styleFrom(
+                              minimumSize: Size.zero,
+                              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                              padding: EdgeInsets.zero,
+                            ),
+                            child: const Text(
+                              'Create an account',
+                              style: TextStyle(
+                                color: AppColors.primary,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
                           ),
                         ],
                       ),
@@ -511,7 +1352,10 @@ class _LoginScreenState extends State<LoginScreen> {
         suffixIcon: suffix,
         filled: true,
         fillColor: const Color(0xFFF6F9FC),
-        contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        contentPadding: const EdgeInsets.symmetric(
+          horizontal: 12,
+          vertical: 10,
+        ),
         border: OutlineInputBorder(
           borderRadius: BorderRadius.circular(8),
           borderSide: const BorderSide(color: Color(0xFFDBE3EE)),
@@ -528,25 +1372,847 @@ class _LoginScreenState extends State<LoginScreen> {
     );
   }
 
-  void _onLogin() {
+  Future<void> _onLogin() async {
     final username = _usernameController.text.trim();
     final password = _passwordController.text;
 
-    if (username == _validUsername && password == _validPassword) {
-      Navigator.of(context).pushReplacement(
-        MaterialPageRoute(builder: (_) => const MainNavigationShell()),
+    if (username.isEmpty || password.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Enter your username and password.')),
       );
       return;
     }
 
+    final isRegisteredUser = await AccountStore.validate(username, password);
+    final isDefaultUser =
+        username == _validUsername && password == _validPassword;
+    if (!mounted) {
+      return;
+    }
+
+    if (isDefaultUser || isRegisteredUser) {
+      await _continueAfterLogin();
+      return;
+    }
+
     ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Invalid credentials. Try admin / admin123.')),
+      const SnackBar(content: Text('Invalid credentials. Please try again.')),
+    );
+  }
+
+  Future<void> _continueAfterLogin() async {
+    final savedLocation = await LocationStore.load();
+    if (!mounted) {
+      return;
+    }
+
+    if (savedLocation == null) {
+      final location = await Navigator.of(context).push<AppLocation>(
+        MaterialPageRoute(
+          builder: (_) =>
+              const SetLocationScreen(requireBeforeProceeding: true),
+        ),
+      );
+
+      if (!mounted || location == null) {
+        return;
+      }
+
+      Navigator.of(context).pushReplacement(
+        MaterialPageRoute(
+          builder: (_) => MainNavigationShell(initialLocation: location),
+        ),
+      );
+      return;
+    }
+
+    Navigator.of(context).pushReplacement(
+      MaterialPageRoute(
+        builder: (_) => MainNavigationShell(initialLocation: savedLocation),
+      ),
+    );
+  }
+
+  Future<void> _openRegisterScreen() async {
+    final createdUsername = await Navigator.of(
+      context,
+    ).push<String>(MaterialPageRoute(builder: (_) => const RegisterScreen()));
+
+    if (!mounted || createdUsername == null) {
+      return;
+    }
+
+    _usernameController.text = createdUsername;
+    _passwordController.clear();
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Account created. You can now sign in.')),
     );
   }
 }
 
+class RegisterScreen extends StatefulWidget {
+  const RegisterScreen({super.key});
+
+  @override
+  State<RegisterScreen> createState() => _RegisterScreenState();
+}
+
+class _RegisterScreenState extends State<RegisterScreen> {
+  final TextEditingController _usernameController = TextEditingController();
+  final TextEditingController _emailController = TextEditingController();
+  final TextEditingController _passwordController = TextEditingController();
+  final TextEditingController _confirmPasswordController =
+      TextEditingController();
+
+  bool _obscurePassword = true;
+  bool _obscureConfirm = true;
+  bool _isSaving = false;
+
+  @override
+  void dispose() {
+    _usernameController.dispose();
+    _emailController.dispose();
+    _passwordController.dispose();
+    _confirmPasswordController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text(
+          'Create Account',
+          style: TextStyle(
+            fontWeight: FontWeight.w700,
+            color: AppColors.textMain,
+          ),
+        ),
+      ),
+      body: AppViewport(
+        child: ListView(
+          padding: const EdgeInsets.all(16),
+          children: [
+            const Text(
+              'Register a new account to sign in to Aegis-Dry.',
+              style: TextStyle(fontSize: 16, color: AppColors.textMuted),
+            ),
+            const SizedBox(height: 16),
+            _buildField(
+              controller: _usernameController,
+              label: 'Username',
+              hint: 'jane_doe',
+              icon: Icons.person_outline,
+            ),
+            const SizedBox(height: 12),
+            _buildField(
+              controller: _emailController,
+              label: 'Email',
+              hint: 'jane@example.com',
+              icon: Icons.mail_outline,
+            ),
+            const SizedBox(height: 12),
+            _buildField(
+              controller: _passwordController,
+              label: 'Password',
+              hint: 'At least 6 characters',
+              icon: Icons.lock_outline,
+              obscure: _obscurePassword,
+              suffix: IconButton(
+                onPressed: () =>
+                    setState(() => _obscurePassword = !_obscurePassword),
+                icon: Icon(
+                  _obscurePassword
+                      ? Icons.visibility_outlined
+                      : Icons.visibility_off_outlined,
+                  color: const Color(0xFF8C9BB2),
+                ),
+              ),
+            ),
+            const SizedBox(height: 12),
+            _buildField(
+              controller: _confirmPasswordController,
+              label: 'Confirm Password',
+              hint: 'Re-enter password',
+              icon: Icons.verified_user_outlined,
+              obscure: _obscureConfirm,
+              suffix: IconButton(
+                onPressed: () =>
+                    setState(() => _obscureConfirm = !_obscureConfirm),
+                icon: Icon(
+                  _obscureConfirm
+                      ? Icons.visibility_outlined
+                      : Icons.visibility_off_outlined,
+                  color: const Color(0xFF8C9BB2),
+                ),
+              ),
+            ),
+            const SizedBox(height: 18),
+            FilledButton(
+              onPressed: _isSaving ? null : _onCreateAccount,
+              style: FilledButton.styleFrom(
+                minimumSize: const Size(double.infinity, 50),
+                backgroundColor: AppColors.primary,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(10),
+                ),
+              ),
+              child: _isSaving
+                  ? const SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        color: Colors.white,
+                      ),
+                    )
+                  : const Text(
+                      'Create Account',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildField({
+    required TextEditingController controller,
+    required String label,
+    required String hint,
+    required IconData icon,
+    bool obscure = false,
+    Widget? suffix,
+  }) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          label,
+          style: const TextStyle(
+            fontWeight: FontWeight.w700,
+            color: AppColors.textMain,
+          ),
+        ),
+        const SizedBox(height: 6),
+        TextField(
+          controller: controller,
+          obscureText: obscure,
+          decoration: InputDecoration(
+            hintText: hint,
+            prefixIcon: Icon(icon, size: 18, color: const Color(0xFF97A7BE)),
+            suffixIcon: suffix,
+            filled: true,
+            fillColor: const Color(0xFFF6F9FC),
+            contentPadding: const EdgeInsets.symmetric(
+              horizontal: 12,
+              vertical: 10,
+            ),
+            border: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(8),
+              borderSide: const BorderSide(color: Color(0xFFDBE3EE)),
+            ),
+            enabledBorder: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(8),
+              borderSide: const BorderSide(color: Color(0xFFDBE3EE)),
+            ),
+            focusedBorder: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(8),
+              borderSide: const BorderSide(color: AppColors.primary),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Future<void> _onCreateAccount() async {
+    final username = _usernameController.text.trim();
+    final email = _emailController.text.trim();
+    final password = _passwordController.text;
+    final confirmPassword = _confirmPasswordController.text;
+    final emailRegex = RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$');
+
+    if (username.length < 3) {
+      _showMessage('Username must be at least 3 characters.');
+      return;
+    }
+    if (!emailRegex.hasMatch(email)) {
+      _showMessage('Enter a valid email address.');
+      return;
+    }
+    if (password.length < 6) {
+      _showMessage('Password must be at least 6 characters.');
+      return;
+    }
+    if (password != confirmPassword) {
+      _showMessage('Passwords do not match.');
+      return;
+    }
+
+    final reservedAdmin = username.toLowerCase() == 'admin';
+    final usernameExists = await AccountStore.usernameExists(username);
+    if (reservedAdmin || usernameExists) {
+      _showMessage('Username already exist.');
+      return;
+    }
+
+    final emailExists = await AccountStore.emailExists(email);
+    if (emailExists) {
+      _showMessage('Email already been used.');
+      return;
+    }
+
+    setState(() => _isSaving = true);
+    final isSaved = await AccountStore.save(
+      AppAccount(username: username, email: email, password: password),
+    );
+    if (!mounted) {
+      return;
+    }
+    setState(() => _isSaving = false);
+
+    if (!isSaved) {
+      _showMessage('Could not create account. Please try again.');
+      return;
+    }
+
+    Navigator.of(context).pop(username);
+  }
+
+  void _showMessage(String message) {
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
+  }
+}
+
+class SetLocationScreen extends StatefulWidget {
+  const SetLocationScreen({
+    super.key,
+    this.initialLocation,
+    this.requireBeforeProceeding = false,
+  });
+
+  final AppLocation? initialLocation;
+  final bool requireBeforeProceeding;
+
+  @override
+  State<SetLocationScreen> createState() => _SetLocationScreenState();
+}
+
+class _SetLocationScreenState extends State<SetLocationScreen> {
+  late final TextEditingController _streetController;
+  List<_PhProvinceOption> _provinceOptions = const <_PhProvinceOption>[];
+  List<_PhMunicipalityOption> _municipalityOptions =
+      const <_PhMunicipalityOption>[];
+  String? _selectedProvinceCode;
+  String? _selectedProvinceName;
+  String? _selectedMunicipality;
+  bool _isLoadingProvinces = true;
+  bool _isLoadingMunicipalities = false;
+  bool _isSavingLocation = false;
+
+  _PhMunicipalityOption? get _selectedMunicipalityOption {
+    final selected = _selectedMunicipality;
+    if (selected == null) {
+      return null;
+    }
+    for (final option in _municipalityOptions) {
+      if (option.displayName == selected) {
+        return option;
+      }
+    }
+    return null;
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _streetController = TextEditingController(
+      text:
+          widget.initialLocation?.street ??
+          _extractStreet(widget.initialLocation?.label),
+    );
+    unawaited(_initializeSelectors());
+  }
+
+  Future<void> _initializeSelectors() async {
+    final parsedProvince =
+        widget.initialLocation?.province ??
+        _extractProvince(widget.initialLocation?.label);
+    final parsedCity =
+        widget.initialLocation?.city ??
+        _extractCity(widget.initialLocation?.label);
+
+    try {
+      final provinces = await _PhilippinesLocationService.fetchProvinces();
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _provinceOptions = provinces;
+        _isLoadingProvinces = false;
+      });
+
+      final matchedProvince = _findProvinceByName(parsedProvince);
+      if (matchedProvince != null) {
+        await _onProvinceChanged(
+          matchedProvince.code,
+          preselectedMunicipality: parsedCity,
+        );
+      }
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _isLoadingProvinces = false;
+      });
+      _showMessage(
+        'Could not load the full Philippines location list right now. Check your internet and try again.',
+      );
+    }
+  }
+
+  @override
+  void dispose() {
+    _streetController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return PopScope(
+      canPop: !widget.requireBeforeProceeding,
+      child: Scaffold(
+        appBar: AppBar(
+          automaticallyImplyLeading: !widget.requireBeforeProceeding,
+          title: Text(
+            widget.requireBeforeProceeding
+                ? 'Set Location Required'
+                : 'Change Location',
+            style: const TextStyle(
+              fontWeight: FontWeight.w700,
+              color: AppColors.textMain,
+            ),
+          ),
+        ),
+        body: AppViewport(
+          child: ListView(
+            padding: const EdgeInsets.all(16),
+            children: [
+              const Text(
+                'Set a Philippine address so OpenWeather can return accurate rain probability for automation decisions.',
+                style: TextStyle(fontSize: 16, color: AppColors.textMuted),
+              ),
+              if (_isLoadingProvinces || _isLoadingMunicipalities)
+                const Padding(
+                  padding: EdgeInsets.only(top: 10),
+                  child: LinearProgressIndicator(minHeight: 3),
+                ),
+              const SizedBox(height: 16),
+              _buildField(
+                controller: _streetController,
+                label: 'Street / Barangay',
+                hint: 'Blk 5 Lot 2, Brgy. San Isidro',
+                icon: Icons.place_outlined,
+              ),
+              const SizedBox(height: 12),
+              _buildProvinceDropdown(),
+              const SizedBox(height: 12),
+              _buildCityDropdown(),
+              const SizedBox(height: 10),
+              Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFEFF6FF),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: const Color(0xFFCFE0F8)),
+                ),
+                child: const Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Icon(
+                      Icons.info_outline,
+                      color: AppColors.accentBlue,
+                      size: 18,
+                    ),
+                    SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        'Coordinates are set automatically from your selected city for OpenWeather API requests.',
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: Color(0xFF415B7E),
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 18),
+              FilledButton.icon(
+                onPressed: _isSavingLocation ? null : _saveLocation,
+                icon: const Icon(Icons.save_outlined, color: Colors.white),
+                label: const Text(
+                  'Save Location',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                style: FilledButton.styleFrom(
+                  minimumSize: const Size(double.infinity, 50),
+                  backgroundColor: AppColors.primary,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildProvinceDropdown() {
+    final bool disableDropdown = _isLoadingProvinces || _isSavingLocation;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Text(
+          'Province',
+          style: TextStyle(
+            fontWeight: FontWeight.w700,
+            color: AppColors.textMain,
+          ),
+        ),
+        const SizedBox(height: 6),
+        DropdownButtonFormField<String>(
+          key: ValueKey<String?>(_selectedProvinceCode),
+          initialValue: _selectedProvinceCode,
+          isExpanded: true,
+          decoration: _dropdownDecoration(
+            hint: _isLoadingProvinces
+                ? 'Loading provinces...'
+                : 'Select province',
+            icon: Icons.map_outlined,
+          ),
+          items: _provinceOptions
+              .map(
+                (province) => DropdownMenuItem<String>(
+                  value: province.code,
+                  child: Text(province.name, overflow: TextOverflow.ellipsis),
+                ),
+              )
+              .toList(),
+          onChanged: disableDropdown
+              ? null
+              : (value) {
+                  if (value == null) {
+                    return;
+                  }
+                  unawaited(_onProvinceChanged(value));
+                },
+        ),
+      ],
+    );
+  }
+
+  Widget _buildCityDropdown() {
+    final bool disableDropdown =
+        _selectedProvinceCode == null ||
+        _isLoadingMunicipalities ||
+        _isSavingLocation;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Text(
+          'City / Municipality',
+          style: TextStyle(
+            fontWeight: FontWeight.w700,
+            color: AppColors.textMain,
+          ),
+        ),
+        const SizedBox(height: 6),
+        DropdownButtonFormField<String>(
+          key: ValueKey<String?>(
+            '${_selectedProvinceCode ?? 'none'}:${_selectedMunicipality ?? 'none'}',
+          ),
+          initialValue: _selectedMunicipality,
+          isExpanded: true,
+          decoration: _dropdownDecoration(
+            hint: _selectedProvinceCode == null
+                ? 'Select province first'
+                : (_isLoadingMunicipalities
+                      ? 'Loading cities and municipalities...'
+                      : 'Select city or municipality'),
+            icon: Icons.location_city_outlined,
+          ),
+          items: _municipalityOptions
+              .map(
+                (municipality) => DropdownMenuItem<String>(
+                  value: municipality.displayName,
+                  child: Text(
+                    municipality.displayName,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+              )
+              .toList(),
+          onChanged: disableDropdown
+              ? null
+              : (value) {
+                  setState(() {
+                    _selectedMunicipality = value;
+                  });
+                },
+        ),
+      ],
+    );
+  }
+
+  InputDecoration _dropdownDecoration({
+    required String hint,
+    required IconData icon,
+  }) {
+    return InputDecoration(
+      hintText: hint,
+      prefixIcon: Icon(icon, color: const Color(0xFF93A4BC)),
+      filled: true,
+      fillColor: Colors.white,
+      border: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(10),
+        borderSide: const BorderSide(color: Color(0xFFD8E1EC)),
+      ),
+      enabledBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(10),
+        borderSide: const BorderSide(color: Color(0xFFD8E1EC)),
+      ),
+      focusedBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(10),
+        borderSide: const BorderSide(color: AppColors.primary),
+      ),
+    );
+  }
+
+  Widget _buildField({
+    required TextEditingController controller,
+    required String label,
+    required String hint,
+    required IconData icon,
+  }) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          label,
+          style: const TextStyle(
+            fontWeight: FontWeight.w700,
+            color: AppColors.textMain,
+          ),
+        ),
+        const SizedBox(height: 6),
+        TextField(
+          controller: controller,
+          decoration: InputDecoration(
+            hintText: hint,
+            prefixIcon: Icon(icon, color: const Color(0xFF93A4BC)),
+            filled: true,
+            fillColor: Colors.white,
+            border: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(10),
+              borderSide: const BorderSide(color: Color(0xFFD8E1EC)),
+            ),
+            enabledBorder: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(10),
+              borderSide: const BorderSide(color: Color(0xFFD8E1EC)),
+            ),
+            focusedBorder: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(10),
+              borderSide: const BorderSide(color: AppColors.primary),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Future<void> _saveLocation() async {
+    final street = _streetController.text.trim();
+    final province = _selectedProvinceName;
+    final municipality = _selectedMunicipalityOption;
+
+    if (street.isEmpty || province == null || municipality == null) {
+      _showMessage('Enter street, select province, and select city.');
+      return;
+    }
+
+    setState(() {
+      _isSavingLocation = true;
+    });
+
+    try {
+      final coordinates = await OpenWeatherService.geocodePhilippineLocation(
+        municipality: municipality.queryName,
+        province: province,
+      );
+
+      final label =
+          '$street, ${municipality.displayName}, $province, Philippines';
+      final location = AppLocation(
+        label: label,
+        latitude: coordinates.$1,
+        longitude: coordinates.$2,
+        street: street,
+        province: province,
+        city: municipality.displayName,
+      );
+      await LocationStore.save(location);
+      if (!mounted) {
+        return;
+      }
+      Navigator.of(context).pop(location);
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      _showMessage(
+        'Could not resolve coordinates for this municipality. Please check your internet and try again.',
+      );
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isSavingLocation = false;
+        });
+      }
+    }
+  }
+
+  void _showMessage(String message) {
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  String _extractStreet(String? label) {
+    if (label == null || label.trim().isEmpty) {
+      return '';
+    }
+    final parts = label.split(',').map((part) => part.trim()).toList();
+    return parts.isEmpty ? '' : parts.first;
+  }
+
+  String? _extractProvince(String? label) {
+    if (label == null || label.trim().isEmpty) {
+      return null;
+    }
+    final parts = label.split(',').map((part) => part.trim()).toList();
+    if (parts.length >= 3) {
+      return parts[parts.length - 2];
+    }
+    return null;
+  }
+
+  String? _extractCity(String? label) {
+    if (label == null || label.trim().isEmpty) {
+      return null;
+    }
+    final parts = label.split(',').map((part) => part.trim()).toList();
+    if (parts.length >= 2) {
+      return parts[1];
+    }
+    return null;
+  }
+
+  _PhProvinceOption? _findProvinceByName(String? name) {
+    if (name == null || name.trim().isEmpty) {
+      return null;
+    }
+    final normalized = name.trim().toLowerCase();
+    for (final province in _provinceOptions) {
+      if (province.name.toLowerCase() == normalized) {
+        return province;
+      }
+    }
+    return null;
+  }
+
+  Future<void> _onProvinceChanged(
+    String provinceCode, {
+    String? preselectedMunicipality,
+  }) async {
+    _PhProvinceOption? selectedProvince;
+    for (final province in _provinceOptions) {
+      if (province.code == provinceCode) {
+        selectedProvince = province;
+        break;
+      }
+    }
+    if (selectedProvince == null) {
+      return;
+    }
+
+    setState(() {
+      _selectedProvinceCode = selectedProvince!.code;
+      _selectedProvinceName = selectedProvince.name;
+      _municipalityOptions = const <_PhMunicipalityOption>[];
+      _selectedMunicipality = null;
+      _isLoadingMunicipalities = true;
+    });
+
+    try {
+      final municipalities =
+          await _PhilippinesLocationService.fetchMunicipalities(
+            provinceCode: selectedProvince.code,
+          );
+      if (!mounted) {
+        return;
+      }
+
+      String? selectedName;
+      if (preselectedMunicipality != null) {
+        final normalized = preselectedMunicipality.trim().toLowerCase();
+        for (final option in municipalities) {
+          if (option.displayName.toLowerCase() == normalized) {
+            selectedName = option.displayName;
+            break;
+          }
+        }
+      }
+
+      setState(() {
+        _municipalityOptions = municipalities;
+        _selectedMunicipality = selectedName;
+        _isLoadingMunicipalities = false;
+      });
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _isLoadingMunicipalities = false;
+      });
+      _showMessage(
+        'Could not load municipalities for the selected province. Please try again.',
+      );
+    }
+  }
+}
+
 class MainNavigationShell extends StatefulWidget {
-  const MainNavigationShell({super.key});
+  const MainNavigationShell({super.key, required this.initialLocation});
+
+  final AppLocation initialLocation;
 
   @override
   State<MainNavigationShell> createState() => _MainNavigationShellState();
@@ -554,6 +2220,18 @@ class MainNavigationShell extends StatefulWidget {
 
 class _MainNavigationShellState extends State<MainNavigationShell> {
   int _index = 0;
+  late AppLocation _location;
+  WeatherSnapshot? _weather;
+  bool _isWeatherLoading = false;
+  String? _weatherError;
+  DateTime? _lastWeatherSyncAt;
+
+  @override
+  void initState() {
+    super.initState();
+    _location = widget.initialLocation;
+    _refreshWeather();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -561,11 +2239,34 @@ class _MainNavigationShellState extends State<MainNavigationShell> {
       HomeScreen(
         onOpenManualControl: _openManualControl,
         onOpenDashboard: () => setState(() => _index = 1),
+        location: _location,
+        weather: _weather,
+        isWeatherLoading: _isWeatherLoading,
+        weatherError: _weatherError,
+        onRefreshWeather: _refreshWeather,
       ),
-      DashboardScreen(onOpenHistory: _openActivityHistory),
-      DeviceScreen(onOpenManualControl: _openLiveConsoleManual),
-      const AlertsScreen(),
-      SettingsScreen(onOpenThreshold: _openThresholdConfig),
+      DashboardScreen(
+        onOpenHistory: _openActivityHistory,
+        location: _location,
+        weather: _weather,
+        lastWeatherSyncAt: _lastWeatherSyncAt,
+      ),
+      DeviceScreen(
+        onOpenManualControl: _openLiveConsoleManual,
+        location: _location,
+        weather: _weather,
+        lastWeatherSyncAt: _lastWeatherSyncAt,
+      ),
+      AlertsScreen(
+        weather: _weather,
+        location: _location,
+        lastWeatherSyncAt: _lastWeatherSyncAt,
+      ),
+      SettingsScreen(
+        onOpenThreshold: _openThresholdConfig,
+        onChangeLocation: _openChangeLocation,
+        currentLocationLabel: _location.label,
+      ),
     ];
 
     return Scaffold(
@@ -620,15 +2321,74 @@ class _MainNavigationShellState extends State<MainNavigationShell> {
   }
 
   void _openActivityHistory() {
-    Navigator.of(
-      context,
-    ).push(MaterialPageRoute(builder: (_) => const ActivityHistoryScreen()));
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => ActivityHistoryScreen(
+          location: _location,
+          weather: _weather,
+          lastWeatherSyncAt: _lastWeatherSyncAt,
+        ),
+      ),
+    );
   }
 
   void _openThresholdConfig() {
     Navigator.of(context).push(
       MaterialPageRoute(builder: (_) => const ThresholdConfigurationScreen()),
     );
+  }
+
+  Future<void> _openChangeLocation() async {
+    final updatedLocation = await Navigator.of(context).push<AppLocation>(
+      MaterialPageRoute(
+        builder: (_) => SetLocationScreen(initialLocation: _location),
+      ),
+    );
+    if (updatedLocation == null || !mounted) {
+      return;
+    }
+    setState(() {
+      _location = updatedLocation;
+      _weatherError = null;
+    });
+    await _refreshWeather();
+  }
+
+  Future<void> _refreshWeather() async {
+    setState(() {
+      _isWeatherLoading = true;
+      _weatherError = null;
+    });
+
+    try {
+      final weather = await OpenWeatherService.getSnapshot(
+        latitude: _location.latitude,
+        longitude: _location.longitude,
+      );
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _weather = weather;
+        _lastWeatherSyncAt = DateTime.now();
+      });
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      final message = error.toString().replaceFirst('Bad state: ', '').trim();
+      setState(() {
+        _weatherError = message.isEmpty
+            ? 'Weather sync failed. Please check your internet and try again.'
+            : message;
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isWeatherLoading = false;
+        });
+      }
+    }
   }
 }
 
@@ -637,10 +2397,20 @@ class HomeScreen extends StatelessWidget {
     super.key,
     required this.onOpenDashboard,
     required this.onOpenManualControl,
+    required this.location,
+    required this.weather,
+    required this.isWeatherLoading,
+    required this.weatherError,
+    required this.onRefreshWeather,
   });
 
   final VoidCallback onOpenDashboard;
   final VoidCallback onOpenManualControl;
+  final AppLocation location;
+  final WeatherSnapshot? weather;
+  final bool isWeatherLoading;
+  final String? weatherError;
+  final Future<void> Function() onRefreshWeather;
 
   @override
   Widget build(BuildContext context) {
@@ -706,23 +2476,59 @@ class HomeScreen extends StatelessWidget {
               ),
             ),
             const SizedBox(height: 16),
+            Row(
+              children: [
+                const Icon(
+                  Icons.location_on_outlined,
+                  color: AppColors.primary,
+                ),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: Text(
+                    location.label,
+                    style: const TextStyle(
+                      color: Color(0xFF5F718E),
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+                IconButton(
+                  onPressed: () => onRefreshWeather(),
+                  icon: const Icon(Icons.refresh, color: AppColors.primary),
+                  tooltip: 'Refresh weather',
+                ),
+              ],
+            ),
+            if (isWeatherLoading)
+              const Padding(
+                padding: EdgeInsets.only(bottom: 8),
+                child: LinearProgressIndicator(minHeight: 3),
+              ),
+            if (weatherError != null)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: Text(
+                  weatherError!,
+                  style: const TextStyle(color: AppColors.danger, fontSize: 12),
+                ),
+              ),
             _buildStatusCard(context),
             const SizedBox(height: 14),
             Row(
-              children: const [
+              children: [
                 Expanded(
                   child: _MetricCard(
                     title: 'TEMP',
-                    value: '72°F',
+                    value: weather?.temperatureFText ?? '--',
                     subtitle: 'Indoor average',
                     icon: Icons.thermostat_outlined,
                   ),
                 ),
-                SizedBox(width: 10),
+                const SizedBox(width: 10),
                 Expanded(
                   child: _MetricCard(
                     title: 'SKY',
-                    value: 'Clear',
+                    value: weather?.sky ?? '--',
                     subtitle: 'Local forecast',
                     icon: Icons.cloud_outlined,
                   ),
@@ -791,17 +2597,19 @@ class HomeScreen extends StatelessWidget {
               ),
             ),
             const SizedBox(height: 10),
-            const _StatTile(
+            _StatTile(
               icon: Icons.water_drop_outlined,
               label: 'Humidity',
-              value: '45%',
+              value: weather == null ? '--' : '${weather!.humidity}%',
             ),
             const SizedBox(height: 8),
-            const _StatTile(
-              icon: Icons.air,
-              label: 'Air Quality',
-              value: 'Excellent',
-              valueColor: AppColors.success,
+            _StatTile(
+              icon: Icons.grain,
+              label: 'Rain Chance',
+              value: weather == null ? '--' : '${weather!.rainProbability}%',
+              valueColor: (weather?.rainProbability ?? 0) >= 60
+                  ? AppColors.danger
+                  : AppColors.success,
             ),
           ],
         ),
@@ -811,6 +2619,12 @@ class HomeScreen extends StatelessWidget {
 
   Widget _buildStatusCard(BuildContext context) {
     final safeText = rs(context, 52, min: 36);
+    final isForecastReady = weather != null;
+    final statusCopy = isForecastReady
+        ? 'Forecast data from ${weather!.source} is active.'
+        : 'Forecast pipeline is initializing. No hardware sensor stream yet.';
+    final progress = isForecastReady ? 1.0 : 0.62;
+    final progressLabel = isForecastReady ? 'Forecast Ready' : 'Syncing';
 
     return Container(
       padding: const EdgeInsets.all(16),
@@ -854,27 +2668,27 @@ class HomeScreen extends StatelessWidget {
               color: AppColors.textMain,
             ),
           ),
-          const Text(
-            'All sensors are operating normally.',
-            style: TextStyle(color: AppColors.textMuted, fontSize: 17),
+          Text(
+            statusCopy,
+            style: const TextStyle(color: AppColors.textMuted, fontSize: 17),
           ),
           const SizedBox(height: 12),
           Row(
             children: [
-              const Expanded(
+              Expanded(
                 child: ClipRRect(
-                  borderRadius: BorderRadius.all(Radius.circular(8)),
+                  borderRadius: const BorderRadius.all(Radius.circular(8)),
                   child: LinearProgressIndicator(
-                    value: 1,
+                    value: progress,
                     minHeight: 6,
                     color: AppColors.success,
-                    backgroundColor: Color(0xFFCAE7D7),
+                    backgroundColor: const Color(0xFFCAE7D7),
                   ),
                 ),
               ),
               const SizedBox(width: 8),
               Text(
-                '100% Secure',
+                progressLabel,
                 style: TextStyle(
                   color: AppColors.success.withValues(alpha: 0.96),
                   fontWeight: FontWeight.w700,
@@ -889,15 +2703,33 @@ class HomeScreen extends StatelessWidget {
 }
 
 class DashboardScreen extends StatelessWidget {
-  const DashboardScreen({super.key, required this.onOpenHistory});
+  const DashboardScreen({
+    super.key,
+    required this.onOpenHistory,
+    required this.location,
+    required this.weather,
+    required this.lastWeatherSyncAt,
+  });
 
   final VoidCallback onOpenHistory;
+  final AppLocation location;
+  final WeatherSnapshot? weather;
+  final DateTime? lastWeatherSyncAt;
 
   @override
   Widget build(BuildContext context) {
     final header = rs(context, 32, min: 24);
     final statusHeadline = rs(context, 44, min: 30);
     final sectionHeader = rs(context, 24, min: 18);
+    final isWarning = (weather?.rainProbability ?? 0) >= 60;
+    final statusLabel = weather == null
+        ? 'Monitoring - Unknown'
+        : (isWarning ? 'Monitoring - Warning' : 'Monitoring - Safe');
+    final activities = buildRecentActivityFeed(
+      location: location,
+      weather: weather,
+      lastWeatherSyncAt: lastWeatherSyncAt,
+    );
 
     return AppViewport(
       child: SafeArea(
@@ -954,7 +2786,7 @@ class DashboardScreen extends StatelessWidget {
                   ),
                   SizedBox(height: 8),
                   Text(
-                    '• Monitoring - Safe',
+                    '• $statusLabel',
                     style: TextStyle(
                       fontSize: statusHeadline,
                       fontWeight: FontWeight.w700,
@@ -962,8 +2794,8 @@ class DashboardScreen extends StatelessWidget {
                     ),
                   ),
                   const SizedBox(height: 8),
-                  const Text(
-                    'Last checked: 2 minutes ago',
+                  Text(
+                    formatRelativeTime(lastWeatherSyncAt),
                     style: TextStyle(fontSize: 20, color: Color(0xFF536579)),
                   ),
                 ],
@@ -980,35 +2812,47 @@ class DashboardScreen extends StatelessWidget {
               ),
             ),
             const SizedBox(height: 10),
-            const Row(
+            Row(
               children: [
                 Expanded(
                   child: _MetricCard(
                     title: '',
-                    value: '24°C',
+                    value: weather == null
+                        ? '--'
+                        : '${weather!.temperatureC.round()}°C',
                     subtitle: 'Temp',
                     icon: Icons.thermostat,
                   ),
                 ),
-                SizedBox(width: 8),
+                const SizedBox(width: 8),
                 Expanded(
                   child: _MetricCard(
                     title: '',
-                    value: '45%',
+                    value: weather == null ? '--' : '${weather!.humidity}%',
                     subtitle: 'Humidity',
                     icon: Icons.water_drop,
                   ),
                 ),
-                SizedBox(width: 8),
+                const SizedBox(width: 8),
                 Expanded(
                   child: _MetricCard(
                     title: '',
-                    value: '10%',
+                    value: weather == null
+                        ? '--'
+                        : '${weather!.rainProbability}%',
                     subtitle: 'Rain',
                     icon: Icons.grain,
                   ),
                 ),
               ],
+            ),
+            const SizedBox(height: 10),
+            Text(
+              'Location: ${location.label}',
+              style: const TextStyle(
+                color: Color(0xFF6A7891),
+                fontWeight: FontWeight.w600,
+              ),
             ),
             const SizedBox(height: 18),
             Row(
@@ -1035,27 +2879,17 @@ class DashboardScreen extends StatelessWidget {
                 ),
               ],
             ),
-            const _ActivityTile(
-              icon: Icons.check_circle_outline,
-              title: 'System Self-Test',
-              subtitle: 'All modules operating normally',
-              time: '10:45 AM',
-            ),
-            const SizedBox(height: 8),
-            const _ActivityTile(
-              icon: Icons.network_ping,
-              title: 'Sensor Sync',
-              subtitle: 'Updated humidity thresholds',
-              time: '09:12 AM',
-            ),
-            const SizedBox(height: 8),
-            const _ActivityTile(
-              icon: Icons.restore,
-              title: 'Routine Backup',
-              subtitle: 'Data synced to cloud',
-              time: 'Yesterday',
-              isMuted: true,
-            ),
+            for (var i = 0; i < math.min(3, activities.length); i++) ...[
+              _ActivityTile(
+                icon: activities[i].icon,
+                title: activities[i].title,
+                subtitle: activities[i].subtitle,
+                time: formatActivityTime(activities[i].timestamp),
+                isMuted: activities[i].isMuted,
+              ),
+              if (i < math.min(3, activities.length) - 1)
+                const SizedBox(height: 8),
+            ],
           ],
         ),
       ),
@@ -1064,15 +2898,31 @@ class DashboardScreen extends StatelessWidget {
 }
 
 class DeviceScreen extends StatelessWidget {
-  const DeviceScreen({super.key, required this.onOpenManualControl});
+  const DeviceScreen({
+    super.key,
+    required this.onOpenManualControl,
+    required this.location,
+    required this.weather,
+    required this.lastWeatherSyncAt,
+  });
 
   final VoidCallback onOpenManualControl;
+  final AppLocation location;
+  final WeatherSnapshot? weather;
+  final DateTime? lastWeatherSyncAt;
 
   @override
   Widget build(BuildContext context) {
     final titleSize = rs(context, 37, min: 28);
     final networkStateSize = rs(context, 48, min: 34);
     final sensorsTitle = rs(context, 36, min: 26);
+    final hasWeather = weather != null;
+    final sourceLabel = weather?.source ?? 'Weather API';
+    final syncLabel = lastWeatherSyncAt == null
+        ? 'PENDING'
+        : formatRelativeTime(
+            lastWeatherSyncAt,
+          ).replaceFirst('Last checked: ', '').toUpperCase();
 
     return AppViewport(
       child: SafeArea(
@@ -1132,7 +2982,7 @@ class DeviceScreen extends StatelessWidget {
                   ),
                   SizedBox(height: 8),
                   Text(
-                    '• Online',
+                    '• ${hasWeather ? 'Online' : 'Syncing'}',
                     style: TextStyle(
                       fontSize: networkStateSize,
                       fontWeight: FontWeight.w700,
@@ -1140,9 +2990,14 @@ class DeviceScreen extends StatelessWidget {
                     ),
                   ),
                   const SizedBox(height: 4),
-                  const Text(
-                    '4 Sensors connected & active',
-                    style: TextStyle(fontSize: 19, color: Color(0xFF667E98)),
+                  Text(
+                    hasWeather
+                        ? '$sourceLabel stream active for ${location.city ?? location.province ?? 'Philippines'}'
+                        : 'Waiting for weather feed to simulate sensor values',
+                    style: const TextStyle(
+                      fontSize: 19,
+                      color: Color(0xFF667E98),
+                    ),
                   ),
                 ],
               ),
@@ -1161,12 +3016,12 @@ class DeviceScreen extends StatelessWidget {
                   ),
                 ),
                 const SizedBox(width: 8),
-                const Flexible(
+                Flexible(
                   child: Text(
-                    'LAST SYNC: JUST NOW',
+                    'LAST SYNC: $syncLabel',
                     textAlign: TextAlign.right,
                     maxLines: 2,
-                    style: TextStyle(
+                    style: const TextStyle(
                       letterSpacing: 1.4,
                       color: Color(0xFF7A89A2),
                       fontWeight: FontWeight.w700,
@@ -1176,54 +3031,55 @@ class DeviceScreen extends StatelessWidget {
               ],
             ),
             const SizedBox(height: 12),
-            const _SensorTile(
+            _SensorTile(
               name: 'Rain Sensor',
-              status: 'Online',
-              reading: '0% Dry',
-              time: '2 mins ago',
+              status: hasWeather ? 'Online' : 'Syncing',
+              reading: hasWeather
+                  ? '${weather!.rainProbability}% chance'
+                  : '--',
+              time: hasWeather ? 'Live forecast' : 'Pending',
               icon: Icons.water_drop_outlined,
             ),
             const SizedBox(height: 10),
-            const _SensorTile(
+            _SensorTile(
               name: 'Temperature Sensor',
-              status: 'Online',
-              reading: '24°C',
-              time: '5 mins ago',
+              status: hasWeather ? 'Online' : 'Syncing',
+              reading: hasWeather ? '${weather!.temperatureC.round()}°C' : '--',
+              time: hasWeather ? 'Live forecast' : 'Pending',
               icon: Icons.thermostat,
             ),
             const SizedBox(height: 10),
-            const _SensorTile(
+            _SensorTile(
               name: 'Humidity Sensor',
-              status: 'Online',
-              reading: '45% RH',
-              time: '1 min ago',
+              status: hasWeather ? 'Online' : 'Syncing',
+              reading: hasWeather ? '${weather!.humidity}% RH' : '--',
+              time: hasWeather ? 'Live forecast' : 'Pending',
               icon: Icons.eco_outlined,
             ),
             const SizedBox(height: 10),
-            const _SensorTile(
-              name: 'Soil Moisture',
-              status: 'Offline',
-              reading: 'Link Lost',
-              time: '2 hours ago',
-              icon: Icons.grass,
-              isOffline: true,
+            _SensorTile(
+              name: 'Sky Condition',
+              status: hasWeather ? 'Online' : 'Syncing',
+              reading: hasWeather ? weather!.sky : 'Awaiting sync',
+              time: hasWeather ? sourceLabel : 'Pending',
+              icon: Icons.cloud_outlined,
             ),
             const SizedBox(height: 14),
-            const Row(
+            Row(
               children: [
                 Expanded(
                   child: _InfoStatCard(
-                    title: 'Avg. Battery',
-                    value: '82%',
-                    icon: Icons.battery_5_bar,
+                    title: 'Data Source',
+                    value: sourceLabel,
+                    icon: Icons.dataset_linked_outlined,
                   ),
                 ),
-                SizedBox(width: 10),
+                const SizedBox(width: 10),
                 Expanded(
                   child: _InfoStatCard(
-                    title: 'Signal Strength',
-                    value: 'Excellent',
-                    icon: Icons.signal_cellular_alt,
+                    title: 'Mode',
+                    value: 'Forecast',
+                    icon: Icons.hub_outlined,
                   ),
                 ),
               ],
@@ -1236,11 +3092,23 @@ class DeviceScreen extends StatelessWidget {
 }
 
 class AlertsScreen extends StatelessWidget {
-  const AlertsScreen({super.key});
+  const AlertsScreen({
+    super.key,
+    required this.weather,
+    required this.location,
+    required this.lastWeatherSyncAt,
+  });
+
+  final WeatherSnapshot? weather;
+  final AppLocation location;
+  final DateTime? lastWeatherSyncAt;
 
   @override
   Widget build(BuildContext context) {
     final titleSize = rs(context, 43, min: 30);
+    final now = DateTime.now();
+    final rainProbability = weather?.rainProbability ?? 0;
+    final shouldWarnRain = rainProbability >= 60;
 
     return AppViewport(
       child: SafeArea(
@@ -1273,23 +3141,25 @@ class AlertsScreen extends StatelessWidget {
               ),
             ),
             const SizedBox(height: 10),
-            const _AlertTile(
+            _AlertTile(
               icon: Icons.cloudy_snowing,
               iconColor: Color(0xFFE84E47),
-              title: 'Rain detected - rack\nautomatically retracted',
+              title: shouldWarnRain
+                  ? 'High rain chance - monitor\nauto retract behavior'
+                  : 'Rain risk normal for\n${location.label}',
               body:
-                  'Sensors detected precipitation above\n2mm. Aegis-Dry system secured your\nlaundry.',
-              time: '10:32 AM',
-              rightLabel: 'JUST\nNOW',
+                  'Current forecast: $rainProbability% rain\nprobability for your configured location.\nAutomation remains active.',
+              time: formatClockTime(now.subtract(const Duration(minutes: 3))),
+              rightLabel: 'LIVE\nSYNC',
             ),
             const SizedBox(height: 10),
-            const _AlertTile(
+            _AlertTile(
               icon: Icons.check_circle,
               iconColor: Color(0xFF2BB87E),
               title: 'Rack successfully extended',
               body:
                   'Manual command completed. Your\nrack is now fully deployed for drying.',
-              time: '08:15 AM',
+              time: formatClockTime(now.subtract(const Duration(hours: 2))),
               rightLabel: '2H AGO',
             ),
             const SizedBox(height: 12),
@@ -1302,22 +3172,22 @@ class AlertsScreen extends StatelessWidget {
               ),
             ),
             const SizedBox(height: 10),
-            const _AlertTile(
+            _AlertTile(
               icon: Icons.warning_amber_rounded,
               iconColor: Color(0xFFF0A63B),
-              title: 'High rain probability detected\n(80%)',
+              title: 'High rain probability detected\n($rainProbability%)',
               body:
-                  'Weather forecast indicates likely rain\nwithin the next 30 minutes. Consider\nretracting.',
-              time: '04:45 PM',
+                  'Forecast is evaluated using your saved\ncoordinates for ${location.label}. Consider\nmanual review when threshold is exceeded.',
+              time: formatClockTime(now.subtract(const Duration(hours: 18))),
             ),
             const SizedBox(height: 10),
-            const _AlertTile(
+            _AlertTile(
               icon: Icons.sync,
               iconColor: AppColors.primary,
-              title: 'System Firmware Updated',
+              title: 'Weather and safety checks updated',
               body:
-                  'Aegis-Dry v2.4.0 was installed\nsuccessfully. New rain prediction\nalgorithms active.',
-              time: '11:20 AM',
+                  '${formatRelativeTime(lastWeatherSyncAt)}\nLocation-aware forecast logic is running\nfor automation decisions.',
+              time: formatClockTime(now.subtract(const Duration(hours: 22))),
             ),
           ],
         ),
@@ -1327,9 +3197,16 @@ class AlertsScreen extends StatelessWidget {
 }
 
 class SettingsScreen extends StatefulWidget {
-  const SettingsScreen({super.key, required this.onOpenThreshold});
+  const SettingsScreen({
+    super.key,
+    required this.onOpenThreshold,
+    required this.onChangeLocation,
+    required this.currentLocationLabel,
+  });
 
   final VoidCallback onOpenThreshold;
+  final Future<void> Function() onChangeLocation;
+  final String currentLocationLabel;
 
   @override
   State<SettingsScreen> createState() => _SettingsScreenState();
@@ -1429,6 +3306,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
               title: 'Sensor Calibration',
               subtitle: 'Adjust humidity and temp offsets',
               icon: Icons.tune,
+            ),
+            GestureDetector(
+              onTap: () => widget.onChangeLocation(),
+              child: _ChevronTile(
+                title: 'Change Location',
+                subtitle: widget.currentLocationLabel,
+                icon: Icons.location_on_outlined,
+              ),
             ),
             GestureDetector(
               onTap: widget.onOpenThreshold,
@@ -2041,17 +3926,33 @@ class ManualOverrideLiveScreen extends StatelessWidget {
 }
 
 class ActivityHistoryScreen extends StatelessWidget {
-  const ActivityHistoryScreen({super.key});
+  const ActivityHistoryScreen({
+    super.key,
+    required this.location,
+    required this.weather,
+    required this.lastWeatherSyncAt,
+  });
+
+  final AppLocation location;
+  final WeatherSnapshot? weather;
+  final DateTime? lastWeatherSyncAt;
 
   @override
   Widget build(BuildContext context) {
+    final now = DateTime.now();
+    final activities = buildRecentActivityFeed(
+      location: location,
+      weather: weather,
+      lastWeatherSyncAt: lastWeatherSyncAt,
+    );
+
     return Scaffold(
       appBar: AppBar(
         leading: const BackButton(),
-        title: const Column(
+        title: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text(
+            const Text(
               'Aegis-Dry',
               style: TextStyle(
                 fontWeight: FontWeight.w700,
@@ -2059,7 +3960,7 @@ class ActivityHistoryScreen extends StatelessWidget {
               ),
             ),
             Text(
-              'Activity History Logs',
+              'Activity History - ${location.label}',
               style: TextStyle(fontSize: 12, color: AppColors.textMuted),
             ),
           ],
@@ -2112,8 +4013,8 @@ class ActivityHistoryScreen extends StatelessWidget {
               ),
             ),
             const SizedBox(height: 12),
-            const Text(
-              'TODAY - OCT 24, 2023',
+            Text(
+              'TODAY - ${formatDayDate(now)}',
               style: TextStyle(
                 color: Color(0xFF7588A4),
                 letterSpacing: 2,
@@ -2121,34 +4022,15 @@ class ActivityHistoryScreen extends StatelessWidget {
               ),
             ),
             const SizedBox(height: 8),
-            const _TimelineItem(
-              title: 'Rain sensor triggered',
-              subtitle: 'Moisture levels exceeded 15% threshold.',
-              time: '14:32 PM',
-              response: 'Rack automatically retracted to Home\nposition.',
-            ),
-            const _TimelineItem(
-              title: 'Manual override used',
-              subtitle: "User 'Admin' initiated manual extension.",
-              time: '12:15 PM',
-              response: 'Auto-mode suspended for 60 minutes.',
-              icon: Icons.pan_tool_alt_outlined,
-            ),
-            const _TimelineItem(
-              title: 'Threshold updated',
-              subtitle: 'Humidity sensitivity adjusted from 60% to\n55%.',
-              time: '09:40 AM',
-              response: 'New parameters synchronized to local\nhub.',
-              icon: Icons.tune,
-            ),
-            const _TimelineItem(
-              title: 'Rack automatically retracted',
-              subtitle: 'Scheduled night-time retraction sequence.',
-              time: '08:02 AM',
-              response: 'Motors engaged. Position: 0% (Closed).',
-              icon: Icons.precision_manufacturing_outlined,
-              isLast: true,
-            ),
+            for (var i = 0; i < activities.length; i++)
+              _TimelineItem(
+                title: activities[i].title,
+                subtitle: activities[i].subtitle,
+                time: formatActivityTime(activities[i].timestamp),
+                response: activities[i].response,
+                icon: activities[i].icon,
+                isLast: i == activities.length - 1,
+              ),
           ],
         ),
       ),
@@ -2339,7 +4221,6 @@ class _SensorTile extends StatelessWidget {
     required this.reading,
     required this.time,
     required this.icon,
-    this.isOffline = false,
   });
 
   final String name;
@@ -2347,19 +4228,14 @@ class _SensorTile extends StatelessWidget {
   final String reading;
   final String time;
   final IconData icon;
-  final bool isOffline;
 
   @override
   Widget build(BuildContext context) {
     final titleSize = rs(context, 24, min: 18);
     final valueSize = rs(context, 24, min: 17);
 
-    final Color dotColor = isOffline
-        ? const Color(0xFFACB9CD)
-        : const Color(0xFF2DB367);
-    final Color readColor = isOffline
-        ? const Color(0xFF9AA9BF)
-        : AppColors.primary;
+    const Color dotColor = Color(0xFF2DB367);
+    const Color readColor = AppColors.primary;
 
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
@@ -2377,10 +4253,7 @@ class _SensorTile extends StatelessWidget {
               color: const Color(0xFFF0F4FB),
               borderRadius: BorderRadius.circular(8),
             ),
-            child: Icon(
-              icon,
-              color: isOffline ? const Color(0xFFABB8CC) : AppColors.accentBlue,
-            ),
+            child: Icon(icon, color: AppColors.accentBlue),
           ),
           const SizedBox(width: 12),
           Expanded(
@@ -2607,7 +4480,7 @@ class _SwitchTile extends StatelessWidget {
               ),
         trailing: Switch(
           value: value,
-          activeColor: AppColors.primary,
+          activeThumbColor: AppColors.primary,
           onChanged: onChanged,
         ),
       ),

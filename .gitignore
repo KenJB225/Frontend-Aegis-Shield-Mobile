@@ -3,6 +3,8 @@
 *.log
 *.pyc
 *.swp
+*.md
+*.markdown
 .DS_Store
 .atom/
 .build/
@@ -43,3 +45,6 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# GitHub/Copilot instruction files
+/.github/instructions/

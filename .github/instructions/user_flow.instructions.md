@@ -1,83 +1,72 @@
-# Mobile App User Flow
+# Aegis-Dry User Flow (Mobile First)
 
-## 1. System Initialization
-1.  User opens the Flutter app after launching Aegis-Dry for the first time.
-2.  Initialization screen displays with progress bar (0-100%).
-3.  System checks: "SENSORS ONLINE" and "CLOUD LINKED" status indicators.
-4.  Once initialization is complete, app transitions to Home screen.
+## Scope
+This instruction defines the primary end-user flow for the Flutter mobile app and the secondary superadmin web flow. The mobile app is the default user experience for device owners and operators.
 
-## 2. Onboarding & Authentication
-1.  User registers or logs in via Supabase Auth (if not already authenticated).
-2.  User connects a new Aegis-Dry device by inputting the ESP32's unique Device ID or MAC Address.
+## 1. Mobile Authentication and Session
+1. User opens the Aegis-Dry mobile app.
+2. App checks for an existing Supabase session.
+3. If no session exists, user is routed to login/signup.
+4. If a valid session exists, app loads the latest user profile and linked devices.
+5. If `is_active` is false, access is blocked and user is prompted to contact admin.
 
-## 3. Home Screen
-1.  **System Status Card:** Displays current system state (e.g., "Safe" with security percentage, "Last checked: 2 minutes ago").
-2.  **Environmental Metrics:** Real-time display of:
-     * Temperature (e.g., 72°F)
-     * Current weather condition (e.g., Clear)
-     * Local forecast data
-3.  **Quick Stats:** Shows current humidity and air quality readings.
-4.  **Quick Actions:** 
-     * "Open Dashboard" button (navigates to detailed device view).
-     * "Manual Control" option (navigates to manual override screen).
+## 2. Mobile Initialization Flow
+1. Splash/initialization screen displays startup progress.
+2. App verifies cloud connectivity and retrieves device state through Next.js API routes.
+3. App loads latest sensor snapshots and recent event logs.
+4. System checks whether user location is already configured.
+5. If location is missing, user is routed to `Set Location` and cannot proceed to Home until saved.
+6. When startup checks and location requirements succeed, app navigates to Home.
 
-## 4. Dashboard View
-1.  **Device Status Section:** Current system status and last check timestamp.
-2.  **Environmental Metrics:** Temperature, humidity percentage, and rain probability.
-3.  **Activity Log:** Recent system events (Self-Test, Sensor Sync, Backups) with timestamps.
+## 3. Mobile Home and Status Monitoring Flow
+1. Home screen shows current system state (`Safe`, `Warning`, `Critical`) and device mode (`AUTO` or `MANUAL`).
+2. User sees key metrics (rain, temperature, humidity, and other configured readings).
+3. Device status (`DOCKED` or `EXTENDED`) and last update time are visible at a glance.
+4. User can open deeper views for device control, logs, alerts, and settings.
 
-## 5. Device Control
-1.  **Network Status:** Shows online/offline status and number of active sensors.
-2.  **Active Sensors Panel:** Lists each sensor with current readings:
-     * Rain Sensor (% Dry)
-     * Temperature Sensor (°C or °F)
-     * Humidity Sensor (% RH)
-     * Soil Moisture Sensor (status and last sync)
-3.  **System Health:** Battery percentage and signal strength indicators.
+## 4. Device Control and Manual Override Flow
+1. User opens Device Control.
+2. In `AUTO` mode, user monitors status and threshold behavior.
+3. User may switch to `MANUAL` mode when override is required.
+4. User sends `DOCK` or `EXTEND` command with optional reason/context.
+5. App sends command intent through Next.js API, which logs the action via edge backend workflows.
+6. Updated device state is reflected in realtime on the app.
 
-## 6. Manual Override
-1.  User navigates to the Manual Override screen.
-2.  **System Status Alert:** Displays current rack position (e.g., "50% Extended" or "Retracted").
-3.  **Safety Protocols:** Lists active safety checks (e.g., "Clear area of obstacles", "Verify weight limit", "Stable power connection").
-4.  **Control Buttons:**
-     * "Extend Rack" button (teal/green).
-     * "Retract Rack" button (blue).
-     * "EMERGENCY STOP" button (red) - Disengages all hydraulic power immediately.
-5.  If system is moving, displays "SYSTEM MOVING..." with progress percentage.
+## 5. Threshold Configuration Flow
+1. User opens Settings or Device Configuration.
+2. User updates precipitation threshold (0-100).
+3. App validates input before save.
+4. On successful update, Next.js API persists the new value and logs `THRESHOLD_UPDATED` via edge backend logic.
 
-## 7. Alerts Section
-1.  User navigates to the Alerts view.
-2.  Displays all system notifications and alerts in chronological order (Today, Yesterday, etc.):
-     * "Rain detected — rack automatically retracted"
-     * "Rack successfully extended"
-     * "High rain probability detected"
-     * "System Firmware Updated"
-3.  Each alert shows timestamp and can be marked as read.
+## 6. Location Management Flow
+1. User opens Settings and selects `Change Location`.
+2. App opens the location form screen prefilled with current coordinates.
+3. User updates location label and latitude/longitude values.
+4. App validates coordinate range before save.
+5. On successful save, app refreshes weather/rain-probability data for the new location.
 
-## 8. Activity History
-1.  User navigates to Activity History Logs.
-2.  **Search & Filter:** Search by log text or filter by type (All, Sensors, System, Manual).
-3.  **Log Entries:** Each entry shows:
-     * Event icon (sensor trigger, manual action, system event, etc.)
-     * Event description
-     * Timestamp
-     * System response (if applicable)
+## 7. Alerts and Activity History Flow
+1. User opens Alerts to review critical and warning events.
+2. User opens Activity History to inspect chronological logs.
+3. User filters/searches logs by date or event type.
+4. Selecting an item reveals event details and system response context.
 
-## 9. Settings & Configuration
-1.  User navigates to Settings.
-2.  **Preferences:** Dark mode toggle, notification settings (Push Notifications, Email Alerts).
-3.  **Device Calibration:**
-     * Sensor Calibration: Adjust humidity and temperature offsets.
-     * Threshold Configuration: Access the main settings panel.
-4.  **Threshold Configuration Panel:**
-     * Displays instructions: "Set the rain probability at which the laundry rack should automatically retract to protect your clothes."
-     * **Rain Probability Threshold:** Slider set to a default value (e.g., 75%).
-     * **Current Local Forecast:** Shows the current rain probability from the local forecast (e.g., "Rain probability for the next 2 hours is 12%").
-     * "Save Settings" button sends a `PUT` request to the Next.js API to update the `devices.rain_threshold` field in Supabase.
-5.  **Application Info:** App version, About section, Sign Out button.
+## 8. Mobile Logout Flow
+1. User taps Logout in Settings or profile section.
+2. App clears local session/token state.
+3. User is routed back to the authentication screen.
 
-## 10. Automated Notification Flow
-1.  ESP32 detects rain via the raindrop sensor OR Next.js backend detects API threshold met.
-2.  Database `status` updates to 'DOCKED'.
-3.  Supabase triggers a notification payload to the user.
-4.  Notification appears in the Alerts section with timestamp and system response details.
+## 9. Secondary Flow: Superadmin Web Panel
+1. Superadmin signs in to the web dashboard.
+2. Superadmin reviews dashboard metrics, user statuses, and audit activity.
+3. Superadmin can enable/disable user access and review activity logs.
+4. All admin actions are captured in `activity_logs` for auditability.
+
+## 10. Cross-Flow Operational Rules
+1. Mobile users only access their own records through RLS-protected data paths.
+2. Superadmin privileges must be role-gated (`SUPER_ADMIN`) and never exposed in mobile UI.
+3. Mobile and device clients should use Next.js API routes for operational commands and data requests.
+4. Next.js API routes must invoke Supabase Edge Functions for backend decision logic and privileged writes.
+5. Device status, threshold changes, and manual overrides must produce traceable log entries.
+6. Location setup is mandatory before weather-driven automation screens are accessible.
+7. Realtime updates should keep Home, Alerts, and Logs synchronized with backend state.
