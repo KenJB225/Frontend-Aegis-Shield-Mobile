@@ -3,10 +3,163 @@ import 'dart:convert';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 
-void main() {
+bool _supabaseInitialized = false;
+String? _supabaseStartupError;
+
+const String _supabaseUrlFromDefine = String.fromEnvironment('SUPABASE_URL');
+const String _supabaseAnonKeyFromDefine = String.fromEnvironment(
+  'SUPABASE_ANON_KEY',
+);
+
+String _supabaseUrl = '';
+String _supabaseAnonKey = '';
+
+String _normalizeEnvValue(String? value) {
+  var normalized = (value ?? '').trim();
+  if (normalized.length >= 2) {
+    final startsWithDouble = normalized.startsWith('"');
+    final endsWithDouble = normalized.endsWith('"');
+    final startsWithSingle = normalized.startsWith("'");
+    final endsWithSingle = normalized.endsWith("'");
+    if ((startsWithDouble && endsWithDouble) ||
+        (startsWithSingle && endsWithSingle)) {
+      normalized = normalized.substring(1, normalized.length - 1).trim();
+    }
+  }
+  return normalized;
+}
+
+bool _isSupabaseSecretKey(String key) {
+  return key.startsWith('sb_secret_');
+}
+
+Future<void> _loadSupabaseConfig() async {
+  try {
+    await dotenv.load(fileName: '.env');
+  } catch (_) {
+    // Keep startup resilient when .env is missing; dart-define fallback still works.
+  }
+
+  _supabaseUrl = _normalizeEnvValue(
+    dotenv.env['SUPABASE_URL'] ?? _supabaseUrlFromDefine,
+  );
+  _supabaseAnonKey = _normalizeEnvValue(
+    dotenv.env['SUPABASE_ANON_KEY'] ?? _supabaseAnonKeyFromDefine,
+  );
+}
+
+bool _supabaseConfigIsValid() {
+  return _supabaseUrl.trim().isNotEmpty && _supabaseAnonKey.trim().isNotEmpty;
+}
+
+String authUnavailableMessage() {
+  if (_supabaseStartupError != null) {
+    return _supabaseStartupError!;
+  }
+  if (!_supabaseConfigIsValid()) {
+    return 'Supabase is not configured. Set SUPABASE_URL and SUPABASE_ANON_KEY in .env or pass --dart-define values.';
+  }
+  return 'Authentication service is unavailable right now.';
+}
+
+String _resolveProfileName({required User user, String? preferredName}) {
+  final explicitName = preferredName?.trim() ?? '';
+  if (explicitName.isNotEmpty) {
+    return explicitName;
+  }
+
+  final metadata = user.userMetadata ?? const <String, dynamic>{};
+  final metadataKeys = <String>['full_name', 'username', 'name'];
+  for (final key in metadataKeys) {
+    final raw = metadata[key];
+    if (raw == null) {
+      continue;
+    }
+    final value = raw.toString().trim();
+    if (value.isNotEmpty) {
+      return value;
+    }
+  }
+
+  final email = (user.email ?? '').trim();
+  if (email.isNotEmpty) {
+    final atIndex = email.indexOf('@');
+    if (atIndex > 0) {
+      return email.substring(0, atIndex);
+    }
+    return email;
+  }
+
+  return 'Aegis User';
+}
+
+Future<void> upsertAuthenticatedUserProfile({
+  User? user,
+  String? preferredName,
+}) async {
+  if (!_supabaseInitialized) {
+    return;
+  }
+
+  final client = Supabase.instance.client;
+  final activeUser = user ?? client.auth.currentUser;
+  if (activeUser == null) {
+    return;
+  }
+
+  await client.from('user_profiles').upsert(<String, dynamic>{
+    'user_id': activeUser.id,
+    'full_name': _resolveProfileName(
+      user: activeUser,
+      preferredName: preferredName,
+    ),
+    'updated_at': DateTime.now().toUtc().toIso8601String(),
+  }, onConflict: 'user_id');
+}
+
+String _profileSyncErrorMessage(Object error) {
+  if (error is PostgrestException) {
+    if (error.code == '42P01') {
+      return 'Supabase table "user_profiles" is missing. Run the database setup SQL first.';
+    }
+    if (error.code == '42501') {
+      return 'Profile database access was denied. Check user_profiles RLS insert/update policies.';
+    }
+    final message = error.message.trim();
+    if (message.isNotEmpty) {
+      return 'Could not sync account profile: $message';
+    }
+  }
+
+  return 'Could not sync account profile to database.';
+}
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await _loadSupabaseConfig();
+
+  if (_supabaseConfigIsValid()) {
+    if (_isSupabaseSecretKey(_supabaseAnonKey)) {
+      _supabaseStartupError =
+          'Do not use a Supabase secret key in Flutter. Use the project anon/publishable key in .env.';
+      runApp(const AegisDryApp());
+      return;
+    }
+
+    try {
+      await Supabase.initialize(url: _supabaseUrl, anonKey: _supabaseAnonKey);
+      _supabaseInitialized = true;
+    } catch (_) {
+      _supabaseStartupError =
+          'Supabase initialization failed. Check SUPABASE_URL and SUPABASE_ANON_KEY.';
+    }
+  }
+
   runApp(const AegisDryApp());
 }
 
@@ -84,12 +237,66 @@ class LocationStore {
   static const String _provinceKey = 'user.location.province';
   static const String _cityKey = 'user.location.city';
 
-  static Future<AppLocation?> load() async {
+  static double? _readDouble(SharedPreferences prefs, String key) {
+    final doubleValue = prefs.getDouble(key);
+    if (doubleValue != null) {
+      return doubleValue;
+    }
+
+    final intValue = prefs.getInt(key);
+    if (intValue != null) {
+      return intValue.toDouble();
+    }
+
+    final stringValue = prefs.getString(key);
+    if (stringValue == null) {
+      return null;
+    }
+
+    return double.tryParse(stringValue.trim());
+  }
+
+  static double? _parseDouble(dynamic value) {
+    if (value is num) {
+      return value.toDouble();
+    }
+    if (value is String) {
+      return double.tryParse(value.trim());
+    }
+    return null;
+  }
+
+  static String? _buildLabel({String? street, String? city, String? province}) {
+    final parts = <String>[];
+    if (street != null && street.trim().isNotEmpty) {
+      parts.add(street.trim());
+    }
+    if (city != null && city.trim().isNotEmpty) {
+      parts.add(city.trim());
+    }
+    if (province != null && province.trim().isNotEmpty) {
+      parts.add(province.trim());
+    }
+    if (parts.isEmpty) {
+      return null;
+    }
+    return '${parts.join(', ')}, Philippines';
+  }
+
+  static String? _fallbackLabel(SharedPreferences prefs) {
+    return _buildLabel(
+      street: prefs.getString(_streetKey),
+      city: prefs.getString(_cityKey),
+      province: prefs.getString(_provinceKey),
+    );
+  }
+
+  static Future<AppLocation?> loadLocal() async {
     final prefs = await SharedPreferences.getInstance();
-    final label = prefs.getString(_labelKey);
-    final lat = prefs.getDouble(_latKey);
-    final lon = prefs.getDouble(_lonKey);
-    if (label == null || lat == null || lon == null) {
+    final label = prefs.getString(_labelKey) ?? _fallbackLabel(prefs);
+    final lat = _readDouble(prefs, _latKey);
+    final lon = _readDouble(prefs, _lonKey);
+    if (label == null || label.trim().isEmpty || lat == null || lon == null) {
       return null;
     }
     return AppLocation(
@@ -123,6 +330,92 @@ class LocationStore {
       await prefs.setString(_cityKey, location.city!);
     }
   }
+
+  static Future<AppLocation?> loadFromSupabase() async {
+    if (!_supabaseInitialized) {
+      return null;
+    }
+    final client = Supabase.instance.client;
+    final user = client.auth.currentUser;
+    if (user == null) {
+      return null;
+    }
+
+    try {
+      final data = await client
+          .from('user_profiles')
+          .select(
+            'location_label, location_lat, location_lon, location_street, location_province, location_city',
+          )
+          .eq('user_id', user.id)
+          .maybeSingle();
+      if (data == null) {
+        return null;
+      }
+
+      final street = (data['location_street'] as String?)?.trim();
+      final province = (data['location_province'] as String?)?.trim();
+      final city = (data['location_city'] as String?)?.trim();
+      final label = (data['location_label'] as String?)?.trim() ??
+          _buildLabel(street: street, city: city, province: province);
+      final lat = _parseDouble(data['location_lat']);
+      final lon = _parseDouble(data['location_lon']);
+      if (label == null || label.isEmpty || lat == null || lon == null) {
+        return null;
+      }
+
+      return AppLocation(
+        label: label,
+        latitude: lat,
+        longitude: lon,
+        street: street,
+        province: province,
+        city: city,
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static Future<bool> saveToSupabase(AppLocation location) async {
+    if (!_supabaseInitialized) {
+      return false;
+    }
+    final client = Supabase.instance.client;
+    final user = client.auth.currentUser;
+    if (user == null) {
+      return false;
+    }
+
+    try {
+      await client.from('user_profiles').upsert(<String, dynamic>{
+        'user_id': user.id,
+        'full_name': _resolveProfileName(user: user),
+        'location_label': location.label,
+        'location_lat': location.latitude,
+        'location_lon': location.longitude,
+        'location_street': location.street,
+        'location_province': location.province,
+        'location_city': location.city,
+        'updated_at': DateTime.now().toUtc().toIso8601String(),
+      }, onConflict: 'user_id');
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+}
+
+Future<AppLocation?> loadLocationWithFallback() async {
+  final local = await LocationStore.loadLocal();
+  if (local != null) {
+    return local;
+  }
+  final remote = await LocationStore.loadFromSupabase();
+  if (remote != null) {
+    await LocationStore.save(remote);
+  }
+  return remote;
 }
 
 class _PhProvinceOption {
@@ -277,98 +570,6 @@ class _PhilippinesLocationService {
   static String _normalizeMunicipalityName(String name) {
     final cityPrefix = RegExp(r'^City of\s+', caseSensitive: false);
     return name.replaceFirst(cityPrefix, '').trim();
-  }
-}
-
-class AppAccount {
-  const AppAccount({
-    required this.username,
-    required this.email,
-    required this.password,
-  });
-
-  final String username;
-  final String email;
-  final String password;
-
-  Map<String, dynamic> toJson() {
-    return <String, dynamic>{
-      'username': username,
-      'email': email,
-      'password': password,
-    };
-  }
-
-  static AppAccount fromJson(Map<String, dynamic> json) {
-    return AppAccount(
-      username: json['username']?.toString() ?? '',
-      email: json['email']?.toString() ?? '',
-      password: json['password']?.toString() ?? '',
-    );
-  }
-}
-
-class AccountStore {
-  static const String _accountsKey = 'user.accounts.v1';
-
-  static Future<List<AppAccount>> load() async {
-    final prefs = await SharedPreferences.getInstance();
-    final raw = prefs.getString(_accountsKey);
-    if (raw == null || raw.isEmpty) {
-      return const <AppAccount>[];
-    }
-
-    final decoded = jsonDecode(raw);
-    if (decoded is! List<dynamic>) {
-      return const <AppAccount>[];
-    }
-
-    return decoded
-        .whereType<Map<String, dynamic>>()
-        .map(AppAccount.fromJson)
-        .toList();
-  }
-
-  static Future<bool> usernameExists(String username) async {
-    final normalized = username.trim().toLowerCase();
-    final accounts = await load();
-    return accounts.any(
-      (account) => account.username.toLowerCase() == normalized,
-    );
-  }
-
-  static Future<bool> emailExists(String email) async {
-    final normalized = email.trim().toLowerCase();
-    final accounts = await load();
-    return accounts.any((account) => account.email.toLowerCase() == normalized);
-  }
-
-  static Future<bool> validate(String username, String password) async {
-    final normalized = username.trim().toLowerCase();
-    final accounts = await load();
-    return accounts.any(
-      (account) =>
-          account.username.toLowerCase() == normalized &&
-          account.password == password,
-    );
-  }
-
-  static Future<bool> save(AppAccount account) async {
-    final prefs = await SharedPreferences.getInstance();
-    final existing = await load();
-    final duplicateUsername = existing.any(
-      (item) => item.username.toLowerCase() == account.username.toLowerCase(),
-    );
-    final duplicateEmail = existing.any(
-      (item) => item.email.toLowerCase() == account.email.toLowerCase(),
-    );
-    if (duplicateUsername || duplicateEmail) {
-      return false;
-    }
-
-    final updated = <AppAccount>[...existing, account];
-    final payload = jsonEncode(updated.map((item) => item.toJson()).toList());
-    return prefs.setString(_accountsKey, payload);
   }
 }
 
@@ -928,11 +1129,62 @@ class _SplashScreenState extends State<SplashScreen> {
       });
       if (_progress >= 1) {
         timer.cancel();
-        Navigator.of(context).pushReplacement(
-          MaterialPageRoute(builder: (_) => const LoginScreen()),
-        );
+        unawaited(_continueAfterSplash());
       }
     });
+  }
+
+  Future<void> _continueAfterSplash() async {
+    final hasSession =
+        _supabaseInitialized &&
+        Supabase.instance.client.auth.currentSession != null;
+
+    if (!hasSession) {
+      if (!mounted) {
+        return;
+      }
+      Navigator.of(
+        context,
+      ).pushReplacement(MaterialPageRoute(builder: (_) => const LoginScreen()));
+      return;
+    }
+
+    try {
+      await upsertAuthenticatedUserProfile();
+    } catch (_) {
+      // Keep splash flow resilient; profile sync is retried on explicit login.
+    }
+
+    final savedLocation = await loadLocationWithFallback();
+    if (!mounted) {
+      return;
+    }
+
+    if (savedLocation == null) {
+      final location = await Navigator.of(context).push<AppLocation>(
+        MaterialPageRoute(
+          builder: (_) =>
+              const SetLocationScreen(requireBeforeProceeding: true),
+        ),
+      );
+
+      if (!mounted || location == null) {
+        return;
+      }
+
+      Navigator.of(context).pushReplacement(
+        MaterialPageRoute(
+          builder: (_) => MainNavigationShell(initialLocation: location),
+        ),
+      );
+      return;
+    }
+
+    Navigator.of(context).pushReplacement(
+      MaterialPageRoute(
+        builder: (_) => MainNavigationShell(initialLocation: savedLocation),
+      ),
+    );
   }
 
   @override
@@ -1111,18 +1363,16 @@ class LoginScreen extends StatefulWidget {
 }
 
 class _LoginScreenState extends State<LoginScreen> {
-  static const String _validUsername = 'admin';
-  static const String _validPassword = 'admin123';
-
-  final TextEditingController _usernameController = TextEditingController();
+  final TextEditingController _emailController = TextEditingController();
   final TextEditingController _passwordController = TextEditingController();
 
   bool _obscurePassword = true;
   bool _rememberMe = false;
+  bool _isSigningIn = false;
 
   @override
   void dispose() {
-    _usernameController.dispose();
+    _emailController.dispose();
     _passwordController.dispose();
     super.dispose();
   }
@@ -1202,7 +1452,7 @@ class _LoginScreenState extends State<LoginScreen> {
                       ),
                       const SizedBox(height: 20),
                       const Text(
-                        'Username',
+                        'Email',
                         style: TextStyle(
                           fontWeight: FontWeight.w700,
                           color: AppColors.textMain,
@@ -1210,9 +1460,9 @@ class _LoginScreenState extends State<LoginScreen> {
                       ),
                       const SizedBox(height: 6),
                       _buildInput(
-                        controller: _usernameController,
-                        hint: 'admin',
-                        icon: Icons.person_outline,
+                        controller: _emailController,
+                        hint: 'name@example.com',
+                        icon: Icons.mail_outline,
                       ),
                       const SizedBox(height: 14),
                       Row(
@@ -1281,7 +1531,7 @@ class _LoginScreenState extends State<LoginScreen> {
                       ),
                       const SizedBox(height: 8),
                       FilledButton(
-                        onPressed: () => _onLogin(),
+                        onPressed: _isSigningIn ? null : _onLogin,
                         style: FilledButton.styleFrom(
                           minimumSize: const Size(double.infinity, 48),
                           backgroundColor: AppColors.primary,
@@ -1289,13 +1539,22 @@ class _LoginScreenState extends State<LoginScreen> {
                             borderRadius: BorderRadius.circular(8),
                           ),
                         ),
-                        child: const Text(
-                          'Login',
-                          style: TextStyle(
-                            color: Colors.white,
-                            fontWeight: FontWeight.w700,
-                          ),
-                        ),
+                        child: _isSigningIn
+                            ? const SizedBox(
+                                width: 20,
+                                height: 20,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                  color: Colors.white,
+                                ),
+                              )
+                            : const Text(
+                                'Login',
+                                style: TextStyle(
+                                  color: Colors.white,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
                       ),
                       const SizedBox(height: 12),
                       Row(
@@ -1373,35 +1632,71 @@ class _LoginScreenState extends State<LoginScreen> {
   }
 
   Future<void> _onLogin() async {
-    final username = _usernameController.text.trim();
+    final email = _emailController.text.trim();
     final password = _passwordController.text;
+    late final AuthResponse response;
 
-    if (username.isEmpty || password.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Enter your username and password.')),
-      );
+    if (email.isEmpty || password.isEmpty) {
+      _showMessage('Enter your email and password.');
       return;
     }
 
-    final isRegisteredUser = await AccountStore.validate(username, password);
-    final isDefaultUser =
-        username == _validUsername && password == _validPassword;
+    if (!_supabaseInitialized) {
+      _showMessage(authUnavailableMessage());
+      return;
+    }
+
+    setState(() => _isSigningIn = true);
+
+    try {
+      response = await Supabase.instance.client.auth.signInWithPassword(
+        email: email,
+        password: password,
+      );
+    } on AuthException catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() => _isSigningIn = false);
+      _showMessage(error.message);
+      return;
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+      setState(() => _isSigningIn = false);
+      _showMessage('Could not sign in right now.');
+      return;
+    }
+
+    try {
+      await upsertAuthenticatedUserProfile(
+        user: response.user ?? Supabase.instance.client.auth.currentUser,
+      );
+    } on PostgrestException catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() => _isSigningIn = false);
+      _showMessage(_profileSyncErrorMessage(error));
+      try {
+        await Supabase.instance.client.auth.signOut();
+      } catch (_) {
+        // Ignore sign-out errors after profile sync failure.
+      }
+      return;
+    }
+
     if (!mounted) {
       return;
     }
 
-    if (isDefaultUser || isRegisteredUser) {
-      await _continueAfterLogin();
-      return;
-    }
-
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Invalid credentials. Please try again.')),
-    );
+    setState(() => _isSigningIn = false);
+    await _continueAfterLogin();
   }
 
   Future<void> _continueAfterLogin() async {
-    final savedLocation = await LocationStore.load();
+    final savedLocation = await loadLocationWithFallback();
     if (!mounted) {
       return;
     }
@@ -1434,19 +1729,23 @@ class _LoginScreenState extends State<LoginScreen> {
   }
 
   Future<void> _openRegisterScreen() async {
-    final createdUsername = await Navigator.of(
+    final createdEmail = await Navigator.of(
       context,
     ).push<String>(MaterialPageRoute(builder: (_) => const RegisterScreen()));
 
-    if (!mounted || createdUsername == null) {
+    if (!mounted || createdEmail == null) {
       return;
     }
 
-    _usernameController.text = createdUsername;
+    _emailController.text = createdEmail;
     _passwordController.clear();
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Account created. You can now sign in.')),
-    );
+    _showMessage('Account created. You can now sign in.');
+  }
+
+  void _showMessage(String message) {
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
   }
 }
 
@@ -1654,34 +1953,74 @@ class _RegisterScreenState extends State<RegisterScreen> {
       return;
     }
 
-    final reservedAdmin = username.toLowerCase() == 'admin';
-    final usernameExists = await AccountStore.usernameExists(username);
-    if (reservedAdmin || usernameExists) {
-      _showMessage('Username already exist.');
-      return;
-    }
-
-    final emailExists = await AccountStore.emailExists(email);
-    if (emailExists) {
-      _showMessage('Email already been used.');
+    if (!_supabaseInitialized) {
+      _showMessage(authUnavailableMessage());
       return;
     }
 
     setState(() => _isSaving = true);
-    final isSaved = await AccountStore.save(
-      AppAccount(username: username, email: email, password: password),
-    );
-    if (!mounted) {
-      return;
-    }
-    setState(() => _isSaving = false);
 
-    if (!isSaved) {
+    try {
+      final response = await Supabase.instance.client.auth.signUp(
+        email: email,
+        password: password,
+        data: <String, dynamic>{'username': username},
+      );
+
+      if (!mounted) {
+        return;
+      }
+
+      setState(() => _isSaving = false);
+
+      if (response.user == null) {
+        _showMessage('Could not create account. Please try again.');
+        return;
+      }
+
+      if (response.session != null) {
+        await upsertAuthenticatedUserProfile(
+          user: response.user,
+          preferredName: username,
+        );
+        if (!mounted) {
+          return;
+        }
+      }
+
+      if (response.session == null) {
+        _showMessage(
+          'Account created. Please check your email to verify your account, then sign in once to sync your profile to database.',
+        );
+      } else {
+        _showMessage('Account created and synced to database.');
+      }
+
+      Navigator.of(context).pop(email);
+    } on AuthException catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() => _isSaving = false);
+      _showMessage(error.message);
+    } on PostgrestException catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() => _isSaving = false);
+      _showMessage(_profileSyncErrorMessage(error));
+      try {
+        await Supabase.instance.client.auth.signOut();
+      } catch (_) {
+        // Ignore sign-out errors after profile sync failure.
+      }
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+      setState(() => _isSaving = false);
       _showMessage('Could not create account. Please try again.');
-      return;
     }
-
-    Navigator.of(context).pop(username);
   }
 
   void _showMessage(String message) {
@@ -2078,8 +2417,12 @@ class _SetLocationScreenState extends State<SetLocationScreen> {
         city: municipality.displayName,
       );
       await LocationStore.save(location);
+      final synced = await LocationStore.saveToSupabase(location);
       if (!mounted) {
         return;
+      }
+      if (!synced) {
+        _showMessage('Saved locally, but could not sync to the cloud.');
       }
       Navigator.of(context).pop(location);
     } catch (error) {
@@ -2265,6 +2608,7 @@ class _MainNavigationShellState extends State<MainNavigationShell> {
       SettingsScreen(
         onOpenThreshold: _openThresholdConfig,
         onChangeLocation: _openChangeLocation,
+        onSignOut: _signOut,
         currentLocationLabel: _location.label,
       ),
     ];
@@ -2389,6 +2733,25 @@ class _MainNavigationShellState extends State<MainNavigationShell> {
         });
       }
     }
+  }
+
+  Future<void> _signOut() async {
+    if (_supabaseInitialized) {
+      try {
+        await Supabase.instance.client.auth.signOut();
+      } catch (_) {
+        // Ignore sign-out errors and continue returning user to login.
+      }
+    }
+
+    if (!mounted) {
+      return;
+    }
+
+    Navigator.of(context).pushAndRemoveUntil(
+      MaterialPageRoute(builder: (_) => const LoginScreen()),
+      (route) => false,
+    );
   }
 }
 
@@ -3201,11 +3564,13 @@ class SettingsScreen extends StatefulWidget {
     super.key,
     required this.onOpenThreshold,
     required this.onChangeLocation,
+    required this.onSignOut,
     required this.currentLocationLabel,
   });
 
   final VoidCallback onOpenThreshold;
   final Future<void> Function() onChangeLocation;
+  final Future<void> Function() onSignOut;
   final String currentLocationLabel;
 
   @override
@@ -3333,11 +3698,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
               title: 'About Aegis-Dry',
               trailingIcon: Icons.info_outline,
             ),
-            const _SimpleInfoTile(
-              title: 'Sign Out',
-              titleColor: Color(0xFFE33131),
-              trailingIcon: Icons.logout,
-              trailingColor: Color(0xFFE33131),
+            GestureDetector(
+              onTap: () => widget.onSignOut(),
+              child: const _SimpleInfoTile(
+                title: 'Sign Out',
+                titleColor: Color(0xFFE33131),
+                trailingIcon: Icons.logout,
+                trailingColor: Color(0xFFE33131),
+              ),
             ),
           ],
         ),

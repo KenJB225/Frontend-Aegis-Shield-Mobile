@@ -48,3 +48,8 @@ app.*.map.json
 
 # GitHub/Copilot instruction files
 /.github/instructions/
+
+# Local environment variables
+.env
+.env.*
+!.env.example
