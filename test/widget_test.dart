@@ -12,6 +12,6 @@ import 'package:aegis_dry_mobile/main.dart';
 void main() {
   testWidgets('App renders splash title', (WidgetTester tester) async {
     await tester.pumpWidget(const AegisDryApp());
-    expect(find.text('Aegis-Dry Smart Dock'), findsOneWidget);
+    expect(find.text('Sun-Dry Smart Dock'), findsOneWidget);
   });
 }
