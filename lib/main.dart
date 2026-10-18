@@ -1,9 +1,9 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
-import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:geocoding/geocoding.dart';
 import 'package:geolocator/geolocator.dart';
@@ -12,6 +12,7 @@ import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:aegis_dry_mobile/services/hardware_service.dart';
+import 'package:aegis_dry_mobile/widgets/silong_logo_image.dart';
 
 bool _supabaseInitialized = false;
 String? _supabaseStartupError;
@@ -37,6 +38,35 @@ String _normalizeEnvValue(String? value) {
     }
   }
   return normalized;
+}
+
+String _weatherSyncErrorMessage(Object error) {
+  final raw = error.toString().replaceFirst('Bad state: ', '').trim();
+  if (raw.isEmpty) {
+    return 'Weather sync is temporarily unavailable. Please try again.';
+  }
+
+  final lower = raw.toLowerCase();
+  final looksLikeNetworkFailure =
+      lower.contains('socketexception') ||
+      lower.contains('clientexception') ||
+      lower.contains('failed host lookup') ||
+      lower.contains('no address associated with hostname') ||
+      lower.contains('name or service not known') ||
+      lower.contains('temporary failure in name resolution') ||
+      lower.contains('network is unreachable') ||
+      lower.contains('connection refused') ||
+      lower.contains('connection timed out') ||
+      lower.contains('timed out') ||
+      lower.contains('api.open-meteo.com') ||
+      lower.contains('api.openweathermap.org') ||
+      lower.contains('geocoding-api.open-meteo.com');
+
+  if (looksLikeNetworkFailure) {
+    return 'Weather sync is temporarily unavailable. Check your internet connection and try again.';
+  }
+
+  return raw;
 }
 
 bool _isSupabaseSecretKey(String key) {
@@ -100,7 +130,7 @@ String _resolveProfileName({required User user, String? preferredName}) {
     return email;
   }
 
-  return 'Sun-Dry User';
+  return 'SILONG User';
 }
 
 Future<void> upsertAuthenticatedUserProfile({
@@ -125,6 +155,52 @@ Future<void> upsertAuthenticatedUserProfile({
     ),
     'updated_at': DateTime.now().toUtc().toIso8601String(),
   }, onConflict: 'user_id');
+}
+
+String firstNameFromDisplayName(String? value) {
+  final trimmed = value?.trim() ?? '';
+  if (trimmed.isEmpty) {
+    return 'User';
+  }
+
+  final emailName = trimmed.contains('@') ? trimmed.split('@').first : trimmed;
+  final cleaned = emailName.replaceAll(RegExp(r'[_\.]+'), ' ').trim();
+  if (cleaned.isEmpty) {
+    return 'User';
+  }
+
+  final first = cleaned.split(RegExp(r'\s+')).first.trim();
+  if (first.isEmpty) {
+    return 'User';
+  }
+  return first[0].toUpperCase() + first.substring(1);
+}
+
+Future<String> loadCurrentUserFirstName() async {
+  if (!_supabaseInitialized) {
+    return 'User';
+  }
+  final client = Supabase.instance.client;
+  final user = client.auth.currentUser;
+  if (user == null) {
+    return 'User';
+  }
+
+  try {
+    final data = await client
+        .from('user_profiles')
+        .select('full_name')
+        .eq('user_id', user.id)
+        .maybeSingle();
+    final fullName = (data?['full_name'] as String?)?.trim();
+    if (fullName != null && fullName.isNotEmpty) {
+      return firstNameFromDisplayName(fullName);
+    }
+  } catch (_) {
+    // Fall back to auth metadata/email when profile lookup is unavailable.
+  }
+
+  return firstNameFromDisplayName(_resolveProfileName(user: user));
 }
 
 String _profileSyncErrorMessage(Object error) {
@@ -175,7 +251,7 @@ class AegisDryApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
-      title: 'Sun-Dry',
+      title: 'SILONG',
       builder: (context, child) {
         final media = MediaQuery.of(context);
         final width = media.size.width;
@@ -363,7 +439,8 @@ class LocationStore {
       final street = (data['location_street'] as String?)?.trim();
       final province = (data['location_province'] as String?)?.trim();
       final city = (data['location_city'] as String?)?.trim();
-      final label = (data['location_label'] as String?)?.trim() ??
+      final label =
+          (data['location_label'] as String?)?.trim() ??
           _buildLabel(street: street, city: city, province: province);
       final lat = _parseDouble(data['location_lat']);
       final lon = _parseDouble(data['location_lon']);
@@ -409,6 +486,455 @@ class LocationStore {
       return true;
     } catch (_) {
       return false;
+    }
+  }
+}
+
+class ThresholdStore {
+  static const String _rainProbabilityKey =
+      'automation.rain_probability_threshold';
+  static const int defaultRainProbability = 75;
+
+  static Future<int> loadRainProbability() async {
+    final prefs = await SharedPreferences.getInstance();
+    final value = prefs.getInt(_rainProbabilityKey);
+    return (value ?? defaultRainProbability).clamp(0, 100);
+  }
+
+  static Future<void> saveRainProbability(int value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(_rainProbabilityKey, value.clamp(0, 100));
+  }
+}
+
+class NotificationPreferences {
+  static const String _enabledKey = 'notifications.push_enabled';
+
+  static Future<bool> loadEnabled() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_enabledKey) ?? false;
+  }
+
+  static Future<void> saveEnabled(bool enabled) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_enabledKey, enabled);
+  }
+}
+
+class PushNotificationService {
+  static const MethodChannel _channel = MethodChannel('sun_dry/notifications');
+
+  static Future<bool> requestPermission() async {
+    try {
+      return await _channel.invokeMethod<bool>('requestPermission') ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  static Future<bool> show({
+    required String title,
+    required String body,
+  }) async {
+    if (!await NotificationPreferences.loadEnabled()) {
+      return false;
+    }
+    try {
+      return await _channel.invokeMethod<bool>('showNotification', {
+            'title': title,
+            'body': body,
+          }) ??
+          false;
+    } catch (_) {
+      return false;
+    }
+  }
+}
+
+class SavedAlert {
+  const SavedAlert({
+    required this.id,
+    required this.type,
+    required this.title,
+    required this.body,
+    required this.timestamp,
+    this.isRead = false,
+    this.rightLabel,
+  });
+
+  final String id;
+  final String type;
+  final String title;
+  final String body;
+  final DateTime timestamp;
+  final bool isRead;
+  final String? rightLabel;
+
+  static SavedAlert? fromMap(dynamic raw) {
+    if (raw is! Map) {
+      return null;
+    }
+    final row = raw.map((key, value) => MapEntry(key.toString(), value));
+    final id = row['id']?.toString();
+    final type = row['type']?.toString();
+    final title = row['title']?.toString();
+    final body = row['body']?.toString();
+    final timestamp = DateTime.tryParse(row['timestamp']?.toString() ?? '');
+    if (id == null ||
+        type == null ||
+        title == null ||
+        body == null ||
+        timestamp == null) {
+      return null;
+    }
+    return SavedAlert(
+      id: id,
+      type: type,
+      title: title,
+      body: body,
+      timestamp: timestamp,
+      isRead: row['is_read'] == true,
+      rightLabel: row['right_label']?.toString(),
+    );
+  }
+}
+
+class AlertStore {
+  static Future<List<SavedAlert>> load() async {
+    if (!_supabaseInitialized) {
+      return const <SavedAlert>[];
+    }
+    final user = Supabase.instance.client.auth.currentUser;
+    if (user == null) {
+      return const <SavedAlert>[];
+    }
+
+    final rows = await Supabase.instance.client
+        .from('user_alerts')
+        .select('id, type, title, body, timestamp, right_label, is_read')
+        .eq('user_id', user.id)
+        .order('timestamp', ascending: false)
+        .limit(40);
+    return (rows as List<dynamic>)
+        .map(SavedAlert.fromMap)
+        .whereType<SavedAlert>()
+        .toList();
+  }
+
+  static Future<bool> saveAlert(SavedAlert alert) async {
+    if (!_supabaseInitialized) {
+      return false;
+    }
+    final user = Supabase.instance.client.auth.currentUser;
+    if (user == null) {
+      return false;
+    }
+
+    try {
+      await Supabase.instance.client.from('user_alerts').insert({
+        'id': alert.id,
+        'user_id': user.id,
+        'type': alert.type,
+        'title': alert.title,
+        'body': alert.body,
+        'timestamp': alert.timestamp.toUtc().toIso8601String(),
+        'right_label': alert.rightLabel,
+        'is_read': alert.isRead,
+      });
+      return true;
+    } on PostgrestException catch (error) {
+      if (error.code == '23505') {
+        return false;
+      }
+      debugPrint('Alert persistence failed: ${error.message}');
+      return false;
+    } catch (error) {
+      debugPrint('Alert persistence failed: $error');
+      return false;
+    }
+  }
+
+  static Future<void> markAllRead() async {
+    if (!_supabaseInitialized) {
+      return;
+    }
+    final user = Supabase.instance.client.auth.currentUser;
+    if (user == null) {
+      return;
+    }
+    await Supabase.instance.client
+        .from('user_alerts')
+        .update({'is_read': true})
+        .eq('user_id', user.id)
+        .eq('is_read', false);
+  }
+}
+
+class RackMovementEvent {
+  const RackMovementEvent({
+    required this.id,
+    required this.deviceId,
+    required this.action,
+    required this.trigger,
+    required this.mode,
+    required this.status,
+    required this.startedAt,
+    this.completedAt,
+    this.durationMs,
+  });
+
+  final String id;
+  final String deviceId;
+  final String action;
+  final String trigger;
+  final String mode;
+  final String status;
+  final DateTime startedAt;
+  final DateTime? completedAt;
+  final int? durationMs;
+
+  factory RackMovementEvent.fromMap(Map<String, dynamic> row) {
+    return RackMovementEvent(
+      id: row['id']?.toString() ?? '',
+      deviceId: row['device_id']?.toString() ?? 'ESP32_RACK_01',
+      action: row['action']?.toString() ?? 'UNKNOWN',
+      trigger: row['trigger']?.toString() ?? 'SYSTEM',
+      mode: row['mode']?.toString() ?? 'AUTO',
+      status: row['status']?.toString() ?? 'COMPLETED',
+      startedAt:
+          DateTime.tryParse(row['started_at']?.toString() ?? '')?.toLocal() ??
+          DateTime.now(),
+      completedAt: DateTime.tryParse(
+        row['completed_at']?.toString() ?? '',
+      )?.toLocal(),
+      durationMs: row['duration_ms'] is num
+          ? (row['duration_ms'] as num).round()
+          : int.tryParse(row['duration_ms']?.toString() ?? ''),
+    );
+  }
+}
+
+class RackMovementAnalytics {
+  const RackMovementAnalytics({
+    required this.events,
+    required this.rangeStart,
+    required this.rangeEnd,
+  });
+
+  final List<RackMovementEvent> events;
+  final DateTime rangeStart;
+  final DateTime rangeEnd;
+
+  int get extensions =>
+      events.where((event) => event.action == 'EXTEND').length;
+  int get retractions =>
+      events.where((event) => event.action == 'RETRACT').length;
+  int get automaticEvents =>
+      events.where((event) => event.mode == 'AUTO').length;
+  int get manualEvents =>
+      events.where((event) => event.mode == 'MANUAL').length;
+  int get rainSensorEvents =>
+      events.where((event) => event.trigger == 'RAIN_SENSOR').length;
+  int get weatherThresholdEvents =>
+      events.where((event) => event.trigger == 'WEATHER_THRESHOLD').length;
+  int get manualTriggerEvents =>
+      events.where((event) => event.trigger == 'MANUAL').length;
+  int get systemEvents =>
+      events.where((event) => event.trigger == 'SYSTEM').length;
+  int get completedEvents =>
+      events.where((event) => event.status == 'COMPLETED').length;
+  int get failedEvents =>
+      events.where((event) => event.status == 'FAILED').length;
+  bool get hasData => events.isNotEmpty;
+  int get totalEvents => events.length;
+
+  RackMovementEvent? get latest => events.isEmpty ? null : events.first;
+
+  Duration? get averageDuration {
+    final durations = events
+        .map((event) => event.durationMs)
+        .whereType<int>()
+        .where((value) => value >= 0)
+        .toList();
+    if (durations.isEmpty) {
+      return null;
+    }
+    final average =
+        durations.fold<int>(0, (sum, value) => sum + value) ~/ durations.length;
+    return Duration(milliseconds: average);
+  }
+
+  String get interpretation {
+    if (!hasData) {
+      return 'No rack movement history is available for this period.';
+    }
+    if (failedEvents > 0) {
+      return '$failedEvents movement${failedEvents == 1 ? '' : 's'} need attention.';
+    }
+    if (manualEvents > automaticEvents) {
+      return 'The rack was mostly managed manually for operator control.';
+    }
+    if (automaticEvents > manualEvents) {
+      return 'The rack was mostly managed automatically for weather protection.';
+    }
+    if (extensions + retractions >= 8) {
+      return 'The rack moved frequently during this period.';
+    }
+    return 'Rack movement activity is within a normal range.';
+  }
+
+  static RackMovementAnalytics fromEvents(
+    List<RackMovementEvent> source, {
+    required DateTime rangeStart,
+    required DateTime rangeEnd,
+  }) {
+    final events =
+        source
+            .where(
+              (event) =>
+                  !event.startedAt.isBefore(rangeStart) &&
+                  event.startedAt.isBefore(rangeEnd),
+            )
+            .toList()
+          ..sort((a, b) => b.startedAt.compareTo(a.startedAt));
+    return RackMovementAnalytics(
+      events: List<RackMovementEvent>.unmodifiable(events),
+      rangeStart: rangeStart,
+      rangeEnd: rangeEnd,
+    );
+  }
+}
+
+class RackMovementStore {
+  static const String _deviceId = 'ESP32_RACK_01';
+
+  static String? _ownerEmail() {
+    if (!_supabaseInitialized) {
+      return null;
+    }
+    return Supabase.instance.client.auth.currentUser?.email
+        ?.trim()
+        .toLowerCase();
+  }
+
+  static Future<bool> record({
+    required String action,
+    required String trigger,
+    required String mode,
+    String status = 'COMPLETED',
+    DateTime? startedAt,
+    DateTime? completedAt,
+    int? durationMs,
+  }) async {
+    final user = _supabaseInitialized
+        ? Supabase.instance.client.auth.currentUser
+        : null;
+    final ownerEmail = _ownerEmail();
+    if (user == null || ownerEmail == null || ownerEmail.isEmpty) {
+      return false;
+    }
+
+    try {
+      await Supabase.instance.client.from('rack_movement_events').insert({
+        'user_id': user.id,
+        'owner_email': ownerEmail,
+        'device_id': _deviceId,
+        'action': action,
+        'trigger': trigger,
+        'mode': mode,
+        'status': status,
+        'started_at': (startedAt ?? DateTime.now()).toUtc().toIso8601String(),
+        'completed_at': completedAt?.toUtc().toIso8601String(),
+        'duration_ms': durationMs,
+      });
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  static Future<void> completePending(String action) async {
+    final user = _supabaseInitialized
+        ? Supabase.instance.client.auth.currentUser
+        : null;
+    if (user == null) {
+      return;
+    }
+
+    try {
+      final client = Supabase.instance.client;
+      final rows = await client
+          .from('rack_movement_events')
+          .select('id, started_at')
+          .eq('user_id', user.id)
+          .eq('device_id', _deviceId)
+          .eq('action', action)
+          .eq('status', 'REQUESTED')
+          .order('started_at', ascending: false)
+          .limit(1);
+      if (rows.isEmpty) {
+        return;
+      }
+
+      final row = rows.first;
+      final completedAt = DateTime.now();
+      final startedAt =
+          DateTime.tryParse(row['started_at']?.toString() ?? '') ?? completedAt;
+      await client
+          .from('rack_movement_events')
+          .update({
+            'status': 'COMPLETED',
+            'completed_at': completedAt.toUtc().toIso8601String(),
+            'duration_ms': completedAt.difference(startedAt).inMilliseconds,
+          })
+          .eq('id', row['id'].toString())
+          .eq('user_id', user.id);
+    } catch (_) {
+      // Keep realtime device updates flowing if analytics persistence fails.
+    }
+  }
+
+  static Future<RackMovementAnalytics> load({int days = 7}) async {
+    final now = DateTime.now();
+    final start = DateTime(
+      now.year,
+      now.month,
+      now.day,
+    ).subtract(Duration(days: days - 1));
+    final end = now.add(const Duration(days: 1));
+    if (!_supabaseInitialized || _ownerEmail() == null) {
+      return RackMovementAnalytics.fromEvents(
+        const <RackMovementEvent>[],
+        rangeStart: start,
+        rangeEnd: end,
+      );
+    }
+
+    try {
+      final rows = await Supabase.instance.client
+          .from('rack_movement_events')
+          .select(
+            'id, device_id, action, trigger, mode, status, started_at, completed_at, duration_ms',
+          )
+          .eq('device_id', _deviceId)
+          .gte('started_at', start.toUtc().toIso8601String())
+          .lt('started_at', end.toUtc().toIso8601String())
+          .order('started_at', ascending: false);
+      final events = (rows as List<dynamic>)
+          .whereType<Map<String, dynamic>>()
+          .map(RackMovementEvent.fromMap)
+          .toList();
+      return RackMovementAnalytics.fromEvents(
+        events,
+        rangeStart: start,
+        rangeEnd: end,
+      );
+    } catch (_) {
+      return RackMovementAnalytics.fromEvents(
+        const <RackMovementEvent>[],
+        rangeStart: start,
+        rangeEnd: end,
+      );
     }
   }
 }
@@ -607,35 +1133,106 @@ class ForecastPoint {
     required this.timestamp,
     required this.rainProbability,
     this.temperatureC,
+    this.cloudCover,
   });
 
   final DateTime timestamp;
   final int rainProbability;
   final double? temperatureC;
+  final int? cloudCover;
 }
 
 class PredictiveAnalytics {
   const PredictiveAnalytics({
     required this.windowHours,
+    required this.nextRainProbability,
+    required this.nextForecastTime,
     required this.maxRainProbability,
     required this.avgRainProbability,
     required this.peakTime,
     required this.dryingWindowHours,
+    required this.bestDryingWindowHours,
+    required this.bestDryingStartTime,
+    required this.bestDryingEndTime,
+    required this.dryingScore,
     required this.riskLevel,
     required this.recommendation,
+    required this.firstHighRiskTime,
   });
 
   final int windowHours;
+  final int nextRainProbability;
+  final DateTime nextForecastTime;
   final int maxRainProbability;
   final int avgRainProbability;
   final DateTime? peakTime;
   final int dryingWindowHours;
+  final int bestDryingWindowHours;
+  final DateTime? bestDryingStartTime;
+  final DateTime? bestDryingEndTime;
+  final int dryingScore;
   final String riskLevel;
   final String recommendation;
+  final DateTime? firstHighRiskTime;
+
+  String get bestDryingWindowLabel {
+    final start = bestDryingStartTime;
+    final end = bestDryingEndTime;
+    if (!hasClearBestDryingWindow || start == null || end == null) {
+      return 'No best drying weather at this time period';
+    }
+    return formatForecastWindow(start, end);
+  }
+
+  bool get hasClearBestDryingWindow {
+    if (bestDryingStartTime == null || bestDryingEndTime == null) {
+      return false;
+    }
+    if (bestDryingWindowHours >= windowHours) {
+      return false;
+    }
+    return dryingScore >= 50;
+  }
+
+  String get nextBestAction {
+    final start = bestDryingStartTime;
+    final end = bestDryingEndTime;
+    if (!hasClearBestDryingWindow || start == null || end == null) {
+      return 'No best drying weather at this time period';
+    }
+
+    final now = DateTime.now();
+    final startDiff = start.difference(now);
+    if (startDiff.inMinutes.abs() <= 30 &&
+        now.isAfter(start.subtract(const Duration(minutes: 30))) &&
+        now.isBefore(end.add(const Duration(minutes: 30)))) {
+      return 'Dry now';
+    }
+
+    if (riskLevel == 'HIGH') {
+      return firstHighRiskTime == null
+          ? 'Retract soon'
+          : 'Retract by ${formatClockTime(firstHighRiskTime!)}';
+    }
+
+    if (startDiff.inMinutes > 0) {
+      return 'Wait until ${formatClockTime(start)}';
+    }
+
+    return 'Keep drying through ${formatClockTime(end)}';
+  }
+
+  String get nextRainRiskLabel {
+    final riskTime = firstHighRiskTime;
+    if (riskTime == null) {
+      return 'No major rain spike in range';
+    }
+    return 'Rain risk rises at ${formatClockTime(riskTime)}';
+  }
 }
 
 class OpenWeatherService {
-  static const String _apiKey = String.fromEnvironment(
+  static const String _apiKeyFromDefine = String.fromEnvironment(
     'OPENWEATHERMAP_API_KEY',
   );
   static const String _edgeFunctionNameFromDefine = String.fromEnvironment(
@@ -646,13 +1243,16 @@ class OpenWeatherService {
     dotenv.env['OPENWEATHER_EDGE_FUNCTION'] ?? _edgeFunctionNameFromDefine,
   );
 
+  static String get _apiKey => _normalizeEnvValue(
+    dotenv.env['OPENWEATHERMAP_API_KEY'] ?? _apiKeyFromDefine,
+  );
+
   static bool get hasApiKey => _apiKey.trim().isNotEmpty;
 
   static bool get hasCloudProvider =>
       _supabaseInitialized && _edgeFunctionName.trim().isNotEmpty;
 
-  static bool get hasAnyOpenWeatherProvider =>
-      hasCloudProvider || hasApiKey;
+  static bool get hasAnyOpenWeatherProvider => hasCloudProvider || hasApiKey;
 
   static Future<(double, double)> geocodePhilippineLocation({
     required String municipality,
@@ -809,25 +1409,37 @@ class OpenWeatherService {
     required double latitude,
     required double longitude,
   }) async {
-    if (hasCloudProvider) {
-      return _getSnapshotFromSupabaseEdge(
+    try {
+      if (hasCloudProvider) {
+        try {
+          return await _getSnapshotFromSupabaseEdge(
+            latitude: latitude,
+            longitude: longitude,
+          );
+        } catch (_) {
+          // Fall through to the direct/fallback providers while the cloud function
+          // is being deployed or its OpenWeather secret is being configured.
+        }
+      }
+
+      if (_apiKey.isNotEmpty) {
+        try {
+          return await _getSnapshotFromOpenWeather(
+            latitude: latitude,
+            longitude: longitude,
+          );
+        } catch (_) {
+          // Fallback below keeps forecast mode operational when OpenWeather is unavailable.
+        }
+      }
+
+      return await _getSnapshotFromOpenMeteo(
         latitude: latitude,
         longitude: longitude,
       );
+    } catch (error) {
+      throw StateError(_weatherSyncErrorMessage(error));
     }
-
-    if (_apiKey.isNotEmpty) {
-      try {
-        return await _getSnapshotFromOpenWeather(
-          latitude: latitude,
-          longitude: longitude,
-        );
-      } catch (_) {
-        // Fallback below keeps forecast mode operational when OpenWeather is unavailable.
-      }
-    }
-
-    return _getSnapshotFromOpenMeteo(latitude: latitude, longitude: longitude);
   }
 
   static Future<WeatherSnapshot> _getSnapshotFromOpenWeather({
@@ -922,8 +1534,8 @@ class OpenWeatherService {
       'latitude': latitude.toString(),
       'longitude': longitude.toString(),
       'current': 'temperature_2m,relative_humidity_2m,weather_code',
-      'hourly': 'precipitation_probability',
-      'forecast_days': '1',
+      'hourly': 'precipitation_probability,cloud_cover,temperature_2m',
+      'forecast_days': '7',
       'timezone': 'auto',
     });
 
@@ -950,15 +1562,45 @@ class OpenWeatherService {
     final sky = _weatherCodeToSky(weatherCode);
 
     final hourly = decoded['hourly'];
-    int rainProbability = 0;
+    final forecastPoints = <ForecastPoint>[];
     if (hourly is Map<String, dynamic>) {
       final pops = hourly['precipitation_probability'];
-      if (pops is List<dynamic> && pops.isNotEmpty) {
-        final first = pops.first;
-        final parsed = first is num ? first.toInt() : int.tryParse('$first');
-        rainProbability = (parsed ?? 0).clamp(0, 100);
+      final times = hourly['time'];
+      final cloudCover = hourly['cloud_cover'];
+      final temperatures = hourly['temperature_2m'];
+      if (times is List<dynamic> && pops is List<dynamic>) {
+        final count = math.min(
+          times.length,
+          cloudCover is List<dynamic>
+              ? math.min(pops.length, cloudCover.length)
+              : pops.length,
+        );
+        for (var i = 0; i < count; i++) {
+          final timestamp = _parseTimestamp(times[i]);
+          final pop = _readInt(pops[i]) ?? 0;
+          if (timestamp != null) {
+            forecastPoints.add(
+              ForecastPoint(
+                timestamp: timestamp,
+                rainProbability: pop.clamp(0, 100),
+                cloudCover: cloudCover is List<dynamic>
+                    ? (_readInt(cloudCover[i]) ?? 0).clamp(0, 100)
+                    : null,
+                temperatureC: temperatures is List<dynamic>
+                    ? _readDouble(temperatures[i])
+                    : null,
+              ),
+            );
+          }
+        }
       }
     }
+
+    final rainProbability = _rainProbabilityForAutomation(forecastPoints);
+    final predictive = _buildPredictiveAnalytics(
+      forecastPoints,
+      currentHumidity: humidity,
+    );
 
     return WeatherSnapshot(
       temperatureC: temperatureC,
@@ -966,6 +1608,8 @@ class OpenWeatherService {
       humidity: humidity,
       rainProbability: rainProbability,
       source: 'Open-Meteo',
+      forecast: forecastPoints,
+      predictive: predictive,
     );
   }
 
@@ -989,10 +1633,11 @@ class OpenWeatherService {
             ?.cast<Map<String, dynamic>>() ??
         const <Map<String, dynamic>>[];
     final forecastPoints = _buildForecastPointsFromOpenWeather(forecastList);
-    final rainPop = forecastPoints.isNotEmpty
-        ? forecastPoints.first.rainProbability
-        : 0;
-    final predictive = _buildPredictiveAnalytics(forecastPoints);
+    final rainPop = _rainProbabilityForAutomation(forecastPoints);
+    final predictive = _buildPredictiveAnalytics(
+      forecastPoints,
+      currentHumidity: humidity,
+    );
 
     return WeatherSnapshot(
       temperatureC: temp,
@@ -1053,18 +1698,18 @@ class OpenWeatherService {
     final temp = _readDouble(current['temp']) ?? 0;
     final humidity = _readInt(current['humidity']) ?? 0;
     final skyList =
-        (current['weather'] as List<dynamic>?)
-            ?.cast<Map<String, dynamic>>() ??
+        (current['weather'] as List<dynamic>?)?.cast<Map<String, dynamic>>() ??
         const <Map<String, dynamic>>[];
     final sky = skyList.isNotEmpty
         ? skyList.first['main']?.toString() ?? 'Unknown'
         : 'Unknown';
 
     final forecastPoints = _buildForecastPointsFromOneCall(hourly);
-    final rainPop = forecastPoints.isNotEmpty
-        ? forecastPoints.first.rainProbability
-        : 0;
-    final predictive = _buildPredictiveAnalytics(forecastPoints);
+    final rainPop = _rainProbabilityForAutomation(forecastPoints);
+    final predictive = _buildPredictiveAnalytics(
+      forecastPoints,
+      currentHumidity: humidity,
+    );
 
     return WeatherSnapshot(
       temperatureC: temp,
@@ -1087,7 +1732,8 @@ class OpenWeatherService {
     final temp =
         _readDouble(current['temp']) ?? _readDouble(current['tempC']) ?? 0;
     final humidity = _readInt(current['humidity']) ?? 0;
-    final sky = _readString(current['sky']) ??
+    final sky =
+        _readString(current['sky']) ??
         _readString(current['condition']) ??
         'Unknown';
 
@@ -1095,8 +1741,11 @@ class OpenWeatherService {
     final rainPop =
         _readInt(current['rainProbability']) ??
         _readInt(current['rain_probability']) ??
-        (forecastPoints.isNotEmpty ? forecastPoints.first.rainProbability : 0);
-    final predictive = _buildPredictiveAnalytics(forecastPoints);
+        _rainProbabilityForAutomation(forecastPoints);
+    final predictive = _buildPredictiveAnalytics(
+      forecastPoints,
+      currentHumidity: humidity,
+    );
 
     return WeatherSnapshot(
       temperatureC: temp,
@@ -1120,11 +1769,13 @@ class OpenWeatherService {
       }
       final popValue = ((_readDouble(entry['pop']) ?? 0) * 100).round();
       final tempValue = _readDouble(entry['main']?['temp']);
+      final cloudCover = _readInt(entry['clouds']?['all']);
       forecastPoints.add(
         ForecastPoint(
           timestamp: timestamp,
           rainProbability: popValue.clamp(0, 100),
           temperatureC: tempValue,
+          cloudCover: cloudCover?.clamp(0, 100),
         ),
       );
     }
@@ -1146,11 +1797,13 @@ class OpenWeatherService {
       }
       final popValue = ((_readDouble(row['pop']) ?? 0) * 100).round();
       final tempValue = _readDouble(row['temp']);
+      final cloudCover = _readInt(row['clouds'] ?? row['cloud_cover']);
       points.add(
         ForecastPoint(
           timestamp: timestamp,
           rainProbability: popValue.clamp(0, 100),
           temperatureC: tempValue,
+          cloudCover: cloudCover?.clamp(0, 100),
         ),
       );
     }
@@ -1172,7 +1825,8 @@ class OpenWeatherService {
       if (timestamp == null) {
         continue;
       }
-      final popValue = _readInt(
+      final popValue =
+          _readInt(
             row['rainProbability'] ??
                 row['rain_probability'] ??
                 row['pop'] ??
@@ -1180,11 +1834,13 @@ class OpenWeatherService {
           ) ??
           0;
       final tempValue = _readDouble(row['temp'] ?? row['tempC']);
+      final cloudCover = _readInt(row['cloudCover'] ?? row['cloud_cover']);
       points.add(
         ForecastPoint(
           timestamp: timestamp,
           rainProbability: popValue.clamp(0, 100),
           temperatureC: tempValue,
+          cloudCover: cloudCover?.clamp(0, 100),
         ),
       );
     }
@@ -1289,32 +1945,80 @@ class OpenWeatherService {
     return text.isEmpty ? null : text;
   }
 
-  static PredictiveAnalytics? _buildPredictiveAnalytics(
+  static List<ForecastPoint> _upcomingForecastPoints(
     List<ForecastPoint> points,
   ) {
+    final now = DateTime.now();
+    final sorted = points.toList()
+      ..sort((a, b) => a.timestamp.compareTo(b.timestamp));
+
+    if (sorted.isEmpty) {
+      return sorted;
+    }
+
+    // OpenWeather's forecast is bucketed, so the most recent bucket is still
+    // relevant for "right now" if the current time is between forecast slots.
+    final lastCurrentIndex = sorted.lastIndexWhere(
+      (point) => !point.timestamp.isAfter(now),
+    );
+    if (lastCurrentIndex >= 0) {
+      return sorted.sublist(lastCurrentIndex);
+    }
+
+    return sorted;
+  }
+
+  static int _rainProbabilityForAutomation(List<ForecastPoint> points) {
+    final upcoming = _upcomingForecastPoints(points);
+    if (upcoming.isEmpty) {
+      return 0;
+    }
+
+    final lookAheadCount = math.min(upcoming.length, 3);
+    final nearTermWindow = upcoming.take(lookAheadCount);
+    final peakChance = nearTermWindow.fold<int>(
+      0,
+      (peak, point) => math.max(peak, point.rainProbability),
+    );
+    return peakChance.clamp(0, 100);
+  }
+
+  static int _estimateForecastIntervalHours(List<ForecastPoint> points) {
+    if (points.length < 2) {
+      return 3;
+    }
+    final sorted = points.toList()
+      ..sort((a, b) => a.timestamp.compareTo(b.timestamp));
+    final minutes = sorted[1].timestamp
+        .difference(sorted[0].timestamp)
+        .inMinutes;
+    if (minutes <= 0) {
+      return 3;
+    }
+    return (minutes / 60).round().clamp(1, 3);
+  }
+
+  static PredictiveAnalytics? _buildPredictiveAnalytics(
+    List<ForecastPoint> points, {
+    required int currentHumidity,
+  }) {
     if (points.isEmpty) {
       return null;
     }
 
     final now = DateTime.now();
-    final upcoming = points
-        .where(
-          (point) =>
-              point.timestamp.isAfter(now.subtract(const Duration(minutes: 1))),
-        )
-        .toList()
-      ..sort((a, b) => a.timestamp.compareTo(b.timestamp));
+    final upcoming = _upcomingForecastPoints(points);
     if (upcoming.isEmpty) {
       return null;
     }
 
-    final window = upcoming
-        .where(
-          (point) =>
-              point.timestamp.isBefore(now.add(const Duration(hours: 12))),
-        )
+    final horizonEnd = now.add(const Duration(days: 7));
+    final horizon = upcoming
+        .where((point) => point.timestamp.isBefore(horizonEnd))
         .toList();
-    final windowPoints = window.isNotEmpty ? window : upcoming.take(4).toList();
+    final windowPoints = horizon.isNotEmpty
+        ? horizon
+        : upcoming.take(8).toList();
     if (windowPoints.isEmpty) {
       return null;
     }
@@ -1323,6 +2027,7 @@ class OpenWeatherService {
       (current, next) =>
           next.rainProbability >= current.rainProbability ? next : current,
     );
+    final intervalHours = _estimateForecastIntervalHours(windowPoints);
     final maxPop = peakPoint.rainProbability;
     final avgPop =
         (windowPoints.fold<int>(
@@ -1331,45 +2036,220 @@ class OpenWeatherService {
                 ) /
                 windowPoints.length)
             .round();
-    final windowHours = math.min(12, windowPoints.length * 3);
-    final firstHighIndex = windowPoints.indexWhere(
+    final windowHours = math.min(
+      7 * 24,
+      math.max(1, windowPoints.length * intervalHours),
+    );
+
+    final firstHighRiskIndex = windowPoints.indexWhere(
       (point) => point.rainProbability >= 60,
     );
-    final dryingWindowHours = firstHighIndex < 0
+    final firstHighRiskTime = firstHighRiskIndex >= 0
+        ? windowPoints[firstHighRiskIndex].timestamp
+        : null;
+    final dryingWindowHours = firstHighRiskIndex < 0
         ? windowHours
-        : math.max(0, firstHighIndex * 3);
-    final riskLevel = maxPop >= 60
-        ? 'HIGH'
-        : (maxPop >= 40 ? 'MODERATE' : 'LOW');
+        : math.max(0, firstHighRiskIndex * intervalHours);
+
+    final dayBuckets = <DateTime, List<ForecastPoint>>{};
+    for (final point in windowPoints) {
+      final dayKey = DateTime(
+        point.timestamp.year,
+        point.timestamp.month,
+        point.timestamp.day,
+      );
+      dayBuckets.putIfAbsent(dayKey, () => <ForecastPoint>[]).add(point);
+    }
+
+    ({DateTime day, List<ForecastPoint> points, double averageScore})? bestDay;
+    for (final entry in dayBuckets.entries) {
+      final dayScores = entry.value
+          .map(
+            (point) => _calculateDryingScore(
+              point: point,
+              currentHumidity: currentHumidity,
+            ),
+          )
+          .toList();
+      if (dayScores.isEmpty) {
+        continue;
+      }
+
+      final averageScore =
+          dayScores.fold<double>(0, (sum, value) => sum + value) /
+          dayScores.length;
+      final candidate = (
+        day: entry.key,
+        points: entry.value,
+        averageScore: averageScore,
+      );
+      if (bestDay == null ||
+          candidate.averageScore > bestDay.averageScore ||
+          (candidate.averageScore == bestDay.averageScore &&
+              candidate.day.isBefore(bestDay.day))) {
+        bestDay = candidate;
+      }
+    }
+
+    final selectedDayPoints = bestDay?.points ?? windowPoints;
+    final selectedIntervalHours = _estimateForecastIntervalHours(
+      selectedDayPoints,
+    );
+    final bestWindow = _findBestDryingWindow(
+      selectedDayPoints,
+      intervalHours: selectedIntervalHours,
+      currentHumidity: currentHumidity,
+    );
+    final bestDryingStartTime = bestWindow == null
+        ? null
+        : selectedDayPoints[bestWindow.startIndex].timestamp;
+    final bestDryingEndTime = bestWindow == null
+        ? null
+        : selectedDayPoints[bestWindow.endIndex].timestamp.add(
+            Duration(hours: selectedIntervalHours),
+          );
+    final int bestDryingWindowHours = bestWindow == null
+        ? 0
+        : (math.max(1, bestWindow.endIndex - bestWindow.startIndex + 1) *
+                  selectedIntervalHours)
+              .toInt();
+    final int dryingScore = bestWindow == null
+        ? _calculateDryingScore(
+            point: selectedDayPoints.first,
+            currentHumidity: currentHumidity,
+          )
+        : bestWindow.averageScore.round().clamp(0, 100).toInt();
+    final riskLevel = dryingScore >= 75
+        ? 'LOW'
+        : (dryingScore >= 50 ? 'MODERATE' : 'HIGH');
 
     return PredictiveAnalytics(
       windowHours: windowHours,
+      nextRainProbability: windowPoints.first.rainProbability,
+      nextForecastTime: windowPoints.first.timestamp,
       maxRainProbability: maxPop,
       avgRainProbability: avgPop,
       peakTime: peakPoint.timestamp,
       dryingWindowHours: dryingWindowHours,
+      bestDryingWindowHours: bestDryingWindowHours,
+      bestDryingStartTime: bestDryingStartTime,
+      bestDryingEndTime: bestDryingEndTime,
+      dryingScore: dryingScore,
       riskLevel: riskLevel,
       recommendation: _buildDryingRecommendation(
+        dryingScore: dryingScore,
         maxPop: maxPop,
         dryingWindowHours: dryingWindowHours,
+        bestStartTime: bestDryingStartTime,
+        bestEndTime: bestDryingEndTime,
+        firstHighRiskTime: firstHighRiskTime,
       ),
+      firstHighRiskTime: firstHighRiskTime,
     );
   }
 
+  static int _calculateDryingScore({
+    required ForecastPoint point,
+    required int currentHumidity,
+  }) {
+    final rainPenalty = point.rainProbability * 0.9;
+    final humidityPenalty = currentHumidity <= 0
+        ? 0.0
+        : math.max(0, currentHumidity - 55) * 0.65;
+    final cloudPenalty = (point.cloudCover ?? 55) * 0.45;
+    final tempBonus = point.temperatureC == null
+        ? 0.0
+        : math.max(0, point.temperatureC! - 26) * 1.2;
+    final score =
+        100 - rainPenalty - humidityPenalty - cloudPenalty + tempBonus;
+    return score.clamp(0, 100).round();
+  }
+
+  static ({int startIndex, int endIndex, double averageScore})?
+  _findBestDryingWindow(
+    List<ForecastPoint> points, {
+    required int intervalHours,
+    required int currentHumidity,
+  }) {
+    if (points.isEmpty) {
+      return null;
+    }
+
+    final maxWindowPoints = intervalHours >= 3
+        ? math.min(points.length, 4)
+        : math.min(points.length, 6);
+    final minWindowPoints = points.length >= 3 ? 3 : 1;
+
+    ({int startIndex, int endIndex, double averageScore})? best;
+
+    for (var length = maxWindowPoints; length >= minWindowPoints; length--) {
+      for (var start = 0; start + length <= points.length; start++) {
+        final end = start + length - 1;
+        final slice = points.sublist(start, end + 1);
+        final scores = slice
+            .map(
+              (point) => _calculateDryingScore(
+                point: point,
+                currentHumidity: currentHumidity,
+              ),
+            )
+            .toList();
+        final averageScore =
+            scores.fold<double>(0, (sum, value) => sum + value) / scores.length;
+        final candidate = (
+          startIndex: start,
+          endIndex: end,
+          averageScore: averageScore,
+        );
+
+        if (best == null ||
+            candidate.averageScore > best.averageScore ||
+            (candidate.averageScore == best.averageScore &&
+                start < best.startIndex)) {
+          best = candidate;
+        }
+      }
+      if (best != null) {
+        break;
+      }
+    }
+
+    return best;
+  }
+
   static String _buildDryingRecommendation({
+    required int dryingScore,
     required int maxPop,
     required int dryingWindowHours,
+    required DateTime? bestStartTime,
+    required DateTime? bestEndTime,
+    required DateTime? firstHighRiskTime,
   }) {
-    if (maxPop >= 70) {
-      if (dryingWindowHours <= 3) {
-        return 'Recommendation: cover or dock the drying rack soon to protect daing/tuyo.';
+    final now = DateTime.now();
+    final highRiskSoon =
+        firstHighRiskTime != null &&
+        firstHighRiskTime.difference(now).inHours <= 3;
+
+    if (maxPop >= 70 || dryingScore < 40) {
+      if (highRiskSoon || dryingWindowHours <= 2) {
+        return 'Recommendation: retract or cover the rack soon to protect daing/tuyo from incoming rain.';
       }
-      return 'Recommendation: finish drying within ~${dryingWindowHours}h before rain risk spikes.';
+      return 'Recommendation: drying looks risky today. Wait for a better drying window.';
     }
-    if (maxPop >= 40) {
-      return 'Recommendation: keep covers nearby and monitor updates for daing/tuyo.';
+
+    if (dryingScore >= 75 && bestStartTime != null && bestEndTime != null) {
+      if (bestStartTime.isBefore(now.add(const Duration(minutes: 30))) &&
+          bestEndTime.isAfter(now)) {
+        return 'Recommendation: dry now. Current sunlight looks best for daing/tuyo.';
+      }
+      return 'Recommendation: the next best drying window opens before rain risk rises.';
     }
-    return 'Recommendation: favorable drying window for daing/tuyo.';
+
+    if (maxPop >= 45) {
+      return 'Recommendation: monitor closely and keep covers nearby for quick rack protection.';
+    }
+
+    return 'Recommendation: dry now if the rack is exposed. Conditions look favorable.';
   }
 
   static String _weatherCodeToSky(int code) {
@@ -1428,87 +2308,27 @@ class ActivityFeedEvent {
   final bool isMuted;
 }
 
-List<ActivityFeedEvent> buildRecentActivityFeed({
-  required AppLocation location,
-  required WeatherSnapshot? weather,
-  required DateTime? lastWeatherSyncAt,
-}) {
-  final now = DateTime.now();
-  final syncAt = lastWeatherSyncAt ?? now.subtract(const Duration(minutes: 1));
-  final cityLabel = location.city ?? location.label;
-  final provinceLabel = location.province ?? 'Philippines';
-
-  if (weather == null) {
-    return <ActivityFeedEvent>[
-      ActivityFeedEvent(
-        icon: Icons.sync_problem,
-        title: 'Weather Sync Pending',
-        subtitle: 'Waiting for forecast data for $cityLabel.',
-        response:
-            'User activity processing is active and will evaluate rain risk once weather sync completes.',
-        timestamp: syncAt,
-      ),
-      ActivityFeedEvent(
-        icon: Icons.location_on_outlined,
-        title: 'Location Profile Loaded',
-        subtitle: 'Monitoring area set to $provinceLabel.',
-        response:
-            'Forecast jobs are queued for ${location.latitude.toStringAsFixed(4)}, ${location.longitude.toStringAsFixed(4)}.',
-        timestamp: now.subtract(const Duration(minutes: 8)),
-      ),
-      ActivityFeedEvent(
-        icon: Icons.cloud_upload_outlined,
-        title: 'Cloud Activity Queue Ready',
-        subtitle:
-            'Event stream is prepared for user actions and weather updates.',
-        response:
-            'System is in forecast-only mode while hardware integration is in progress.',
-        timestamp: now.subtract(const Duration(hours: 1)),
-        isMuted: true,
-      ),
-    ];
-  }
-
-  final rainLevel = weather.rainProbability >= 60
-      ? 'HIGH'
-      : (weather.rainProbability >= 40 ? 'MODERATE' : 'LOW');
-
-  return <ActivityFeedEvent>[
-    ActivityFeedEvent(
-      icon: Icons.cloud_done_outlined,
-      title: 'Weather Sync Complete',
+List<ActivityFeedEvent> buildRecentActivityFeed(
+  RackMovementAnalytics? movementAnalytics,
+) {
+  return (movementAnalytics?.events ?? const <RackMovementEvent>[]).map((
+    event,
+  ) {
+    final action = _rackActionLabel(event.action);
+    final failed = event.status == 'FAILED';
+    return ActivityFeedEvent(
+      icon: failed
+          ? Icons.warning_amber_rounded
+          : (event.action == 'EXTEND'
+                ? Icons.north_east_rounded
+                : Icons.south_west_rounded),
+      title: failed ? '$action movement failed' : 'Rack $action',
       subtitle:
-          '${weather.source} feed: ${weather.temperatureC.round()}°C, ${weather.humidity}% humidity, ${weather.rainProbability}% rain chance.',
-      response:
-          'Latest forecast snapshot was processed and appended to user activity records.',
-      timestamp: syncAt,
-    ),
-    ActivityFeedEvent(
-      icon: Icons.analytics_outlined,
-      title: 'Rain Risk Evaluated',
-      subtitle: '$rainLevel risk level for $provinceLabel.',
-      response: weather.rainProbability >= 60
-          ? 'Auto-retract condition flagged for deployment once hardware is connected.'
-          : 'No retract action required under current forecast conditions.',
-      timestamp: syncAt.subtract(const Duration(minutes: 7)),
-    ),
-    ActivityFeedEvent(
-      icon: Icons.location_on_outlined,
-      title: 'Location-Aware Processing',
-      subtitle: 'Forecast checks are pinned to $cityLabel.',
-      response:
-          'Weather and user activity pipelines remain synchronized for this configured location.',
-      timestamp: syncAt.subtract(const Duration(minutes: 19)),
-    ),
-    ActivityFeedEvent(
-      icon: Icons.restore,
-      title: 'Routine Backup',
-      subtitle: 'User activity and weather summaries were archived.',
-      response: 'Cloud backup completed with no conflicts.',
-      timestamp: now.subtract(const Duration(days: 1)),
-      isMuted: true,
-    ),
-  ];
+          '${_rackTriggerLabel(event.trigger)} · ${event.mode.toLowerCase()} control',
+      response: event.status,
+      timestamp: event.startedAt,
+    );
+  }).toList();
 }
 
 double responsiveScale(BuildContext context) {
@@ -1526,6 +2346,106 @@ String formatClockTime(DateTime time) {
   final hour = time.hour % 12 == 0 ? 12 : time.hour % 12;
   final meridian = time.hour >= 12 ? 'PM' : 'AM';
   return '$hour:${_twoDigits(time.minute)} $meridian';
+}
+
+String? rackActionFromStatus(String status) {
+  final normalized = status.trim().toLowerCase();
+  if (normalized.isEmpty) {
+    return null;
+  }
+  if (normalized.contains('moving') ||
+      normalized.contains('extending') ||
+      normalized.contains('retracting')) {
+    return null;
+  }
+  if (normalized.contains('extend') ||
+      normalized.contains('open') ||
+      normalized.contains('deploy')) {
+    return 'EXTEND';
+  }
+  if (normalized.contains('retract') || normalized.contains('close')) {
+    return 'RETRACT';
+  }
+  return null;
+}
+
+bool isRackMovingStatus(String status) {
+  final normalized = status.trim().toLowerCase();
+  return normalized.contains('moving') ||
+      normalized.contains('extending') ||
+      normalized.contains('retracting');
+}
+
+bool isRackSafetyStatus(String status) {
+  final normalized = status.trim().toUpperCase();
+  return normalized == 'RETURNED_TO_START' ||
+      normalized == 'LIMIT_SWITCH_CONFLICT' ||
+      normalized == 'OBSTRUCTED' ||
+      normalized.startsWith('FAILSAFE_') ||
+      normalized.endsWith('_TIMEOUT');
+}
+
+String rackSafetyTitle(String status) {
+  final normalized = status.trim().toUpperCase();
+  if (normalized == 'LIMIT_SWITCH_CONFLICT') {
+    return 'Limit switch conflict';
+  }
+  if (normalized == 'RETURNED_TO_START') {
+    return 'Rack returned to starting limit';
+  }
+  if (normalized.startsWith('FAILSAFE_')) {
+    return 'Rack returning to starting limit';
+  }
+  if (normalized == 'RETURN_TIMEOUT') {
+    return 'Rack could not return to start';
+  }
+  if (normalized.endsWith('_TIMEOUT')) {
+    return 'Rack movement timed out';
+  }
+  return normalized == 'OBSTRUCTED'
+      ? 'Obstruction detected'
+      : 'Rack retracted for safety';
+}
+
+String rackSafetyBody(String status) {
+  final normalized = status.trim().toUpperCase();
+  if (normalized == 'LIMIT_SWITCH_CONFLICT') {
+    return 'Both end-stop inputs are active. Rack movement is blocked; check switch wiring and alignment.';
+  }
+  if (normalized == 'RETURNED_TO_START') {
+    return 'The rack missed its target limit within 10 seconds, reversed once, and reached its starting limit.';
+  }
+  if (normalized.startsWith('FAILSAFE_')) {
+    return 'Rack movement exceeded 10 seconds; the controller is making one attempt to return to the starting limit.';
+  }
+  if (normalized == 'RETURN_TIMEOUT') {
+    return 'The rack missed its target and starting limits within 10 seconds. It stopped; check the travel path, limit switches, and motor.';
+  }
+  if (normalized.endsWith('_TIMEOUT')) {
+    return 'Rack stopped because it did not reach its limit in time. Check the travel path, limit switches, and motor.';
+  }
+  return normalized == 'OBSTRUCTED'
+      ? 'Rack movement stopped because an obstructing object may be blocking the rack.'
+      : 'The rack automatically retracted because an obstruction was detected.';
+}
+
+String formatAlertRelativeTime(DateTime time) {
+  final diff = DateTime.now().difference(time);
+  if (diff.inSeconds < 60) {
+    return 'Just Now';
+  }
+  if (diff.inMinutes < 60) {
+    return '${diff.inMinutes} mins ago';
+  }
+  if (diff.inHours < 24) {
+    final hours = diff.inHours;
+    return hours == 1 ? '1hr ago' : '${hours}hrs ago';
+  }
+  if (diff.inDays < 7) {
+    final days = diff.inDays;
+    return days == 1 ? '1 day ago' : '${days} days ago';
+  }
+  return formatDayDate(time);
 }
 
 String formatRelativeTime(DateTime? time) {
@@ -1561,6 +2481,273 @@ String formatDayDate(DateTime time) {
     'DEC',
   ];
   return '${months[time.month - 1]} ${time.day}, ${time.year}';
+}
+
+String formatForecastDayDate(DateTime time) {
+  const days = <String>['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+  return '${days[time.weekday - 1]}, ${formatDayDate(time)}';
+}
+
+String formatForecastWindow(DateTime start, DateTime end) {
+  return '${formatClockTime(start)} - ${formatClockTime(end)}';
+}
+
+String formatCompactDuration(Duration duration) {
+  if (duration.inSeconds <= 0) {
+    return 'Now';
+  }
+
+  if (duration.inMinutes < 1) {
+    return 'Less than 1m';
+  }
+
+  final days = duration.inDays;
+  final hours = duration.inHours.remainder(24);
+  final minutes = duration.inMinutes.remainder(60);
+  final parts = <String>[];
+
+  if (days > 0) {
+    parts.add('${days}d');
+  }
+  if (hours > 0) {
+    parts.add('${hours}h');
+  }
+  if (minutes > 0 || parts.isEmpty) {
+    parts.add('${minutes}m');
+  }
+
+  return parts.join(' ');
+}
+
+String formatTimeLeft(DateTime target) {
+  return '${formatCompactDuration(target.difference(DateTime.now()))} left';
+}
+
+String formatDryingWindowCountdown({
+  required DateTime? start,
+  required DateTime? end,
+  required bool hasBestWindow,
+}) {
+  if (!hasBestWindow || start == null || end == null) {
+    return 'No best drying weather at this time period';
+  }
+
+  final now = DateTime.now();
+  if (now.isBefore(start)) {
+    return 'Starts in ${formatCompactDuration(start.difference(now))}';
+  }
+  if (now.isBefore(end)) {
+    return '${formatCompactDuration(end.difference(now))} left';
+  }
+
+  return 'No best drying weather at this time period';
+}
+
+_OptimalSunlightDay? _buildOptimalSunlightWindow(List<ForecastPoint> points) {
+  if (points.isEmpty) {
+    return null;
+  }
+
+  final now = DateTime.now();
+  final horizonEnd = now.add(const Duration(days: 7));
+  final horizon =
+      points
+          .where(
+            (point) =>
+                !point.timestamp.isBefore(
+                  now.subtract(const Duration(minutes: 1)),
+                ) &&
+                point.timestamp.isBefore(horizonEnd),
+          )
+          .toList()
+        ..sort((a, b) => a.timestamp.compareTo(b.timestamp));
+
+  if (horizon.isEmpty) {
+    return null;
+  }
+
+  final dayBuckets = <DateTime, List<ForecastPoint>>{};
+  for (final point in horizon) {
+    final dayKey = DateTime(
+      point.timestamp.year,
+      point.timestamp.month,
+      point.timestamp.day,
+    );
+    dayBuckets.putIfAbsent(dayKey, () => <ForecastPoint>[]).add(point);
+  }
+
+  _OptimalSunlightDay? best;
+  for (final entry in dayBuckets.entries) {
+    final dayPoints = entry.value
+      ..sort((a, b) => a.timestamp.compareTo(b.timestamp));
+    if (dayPoints.isEmpty) {
+      continue;
+    }
+
+    final scores = dayPoints.map(_sunlightScoreFromForecastPoint).toList();
+    final averageSunlight =
+        scores.fold<double>(0, (sum, value) => sum + value) / scores.length;
+    final peakScore = scores.reduce(math.max);
+    final peakIndex = scores.indexOf(peakScore);
+    final peakPoint = dayPoints[peakIndex];
+
+    final candidate = _OptimalSunlightDay(
+      dayStart: entry.key,
+      peakTime: peakPoint.timestamp,
+      averageSunlight: averageSunlight,
+      peakSunlight: peakScore,
+    );
+
+    if (best == null ||
+        candidate.averageSunlight > best.averageSunlight ||
+        (candidate.averageSunlight == best.averageSunlight &&
+            candidate.dayStart.isBefore(best.dayStart))) {
+      best = candidate;
+    }
+  }
+
+  return best;
+}
+
+double _sunlightScoreFromForecastPoint(ForecastPoint point) {
+  final rainSunlight = 100 - point.rainProbability;
+  final cloudSunlight = point.cloudCover == null
+      ? rainSunlight
+      : 100 - point.cloudCover!.clamp(0, 100);
+  return ((rainSunlight * 0.45) + (cloudSunlight * 0.55))
+      .clamp(0, 100)
+      .toDouble();
+}
+
+_WeeklySunlightWindow? _buildWeeklySunlightWindow(
+  List<_WeatherTrendPoint> points,
+) {
+  if (points.isEmpty) {
+    return null;
+  }
+
+  final now = DateTime.now();
+  final horizonEnd = now.add(const Duration(days: 7));
+  final horizon =
+      points
+          .where(
+            (point) =>
+                !point.time.isBefore(
+                  now.subtract(const Duration(minutes: 1)),
+                ) &&
+                point.time.isBefore(horizonEnd),
+          )
+          .toList()
+        ..sort((a, b) => a.time.compareTo(b.time));
+
+  if (horizon.isEmpty) {
+    return null;
+  }
+
+  final dayBuckets = <DateTime, List<_WeatherTrendPoint>>{};
+  for (final point in horizon) {
+    final dayKey = DateTime(point.time.year, point.time.month, point.time.day);
+    dayBuckets.putIfAbsent(dayKey, () => <_WeatherTrendPoint>[]).add(point);
+  }
+
+  _WeeklySunlightWindow? best;
+  for (final entry in dayBuckets.entries) {
+    final dayPoints = entry.value..sort((a, b) => a.time.compareTo(b.time));
+    if (dayPoints.isEmpty) {
+      continue;
+    }
+
+    final dayBest = _findBestSunWindow(dayPoints);
+    if (dayBest == null) {
+      continue;
+    }
+
+    final candidate = _WeeklySunlightWindow(
+      dayStart: entry.key,
+      windowStart: dayPoints[dayBest.startIndex].time,
+      windowEnd: dayPoints[dayBest.endIndex].endTime,
+      averageSunlight: dayBest.averageScore,
+      windowPoints: dayBest.endIndex - dayBest.startIndex + 1,
+      totalDayPoints: dayPoints.length,
+    );
+
+    if (best == null ||
+        candidate.averageSunlight > best.averageSunlight ||
+        (candidate.averageSunlight == best.averageSunlight &&
+            candidate.dayStart.isBefore(best.dayStart))) {
+      best = candidate;
+    }
+  }
+
+  if (best == null) {
+    return null;
+  }
+
+  return best;
+}
+
+class _OptimalSunlightDay {
+  const _OptimalSunlightDay({
+    required this.dayStart,
+    required this.peakTime,
+    required this.averageSunlight,
+    required this.peakSunlight,
+  });
+
+  final DateTime dayStart;
+  final DateTime peakTime;
+  final double averageSunlight;
+  final double peakSunlight;
+
+  String get dayLabel => formatForecastDayDate(dayStart);
+  String get timeLabel => 'Most sunny day';
+}
+
+({int startIndex, int endIndex, double averageScore})? _findBestSunWindow(
+  List<_WeatherTrendPoint> points,
+) {
+  if (points.isEmpty) {
+    return null;
+  }
+
+  final maxWindowPoints = points.length >= 4 ? 4 : points.length;
+  final minWindowPoints = points.length >= 3 ? 2 : 1;
+  ({int startIndex, int endIndex, double averageScore})? best;
+
+  for (var length = maxWindowPoints; length >= minWindowPoints; length--) {
+    for (var start = 0; start + length <= points.length; start++) {
+      final end = start + length - 1;
+      final slice = points.sublist(start, end + 1);
+      final averageScore =
+          slice.fold<double>(
+            0,
+            (sum, point) => sum + point.sunlightProbability,
+          ) /
+          slice.length;
+      final candidate = (
+        startIndex: start,
+        endIndex: end,
+        averageScore: averageScore,
+      );
+
+      if (best == null ||
+          candidate.averageScore > best.averageScore ||
+          (candidate.averageScore == best.averageScore &&
+              start < best.startIndex)) {
+        best = candidate;
+      }
+    }
+
+    if (best != null) {
+      break;
+    }
+  }
+
+  if (best == null) {
+    return null;
+  }
+
+  return best;
 }
 
 String formatActivityTime(DateTime time) {
@@ -1600,21 +2787,11 @@ class SplashScreen extends StatefulWidget {
 }
 
 class _SplashScreenState extends State<SplashScreen> {
-  late final Timer _timer;
-  double _progress = 0.35;
-
   @override
   void initState() {
     super.initState();
-    _timer = Timer.periodic(const Duration(milliseconds: 380), (timer) {
-      if (!mounted) {
-        return;
-      }
-      setState(() {
-        _progress += 0.09;
-      });
-      if (_progress >= 1) {
-        timer.cancel();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
         unawaited(_continueAfterSplash());
       }
     });
@@ -1674,15 +2851,7 @@ class _SplashScreenState extends State<SplashScreen> {
   }
 
   @override
-  void dispose() {
-    _timer.cancel();
-    super.dispose();
-  }
-
-  @override
   Widget build(BuildContext context) {
-    final int percent = (_progress.clamp(0, 1) * 100).toInt();
-
     return Scaffold(
       body: Container(
         decoration: const BoxDecoration(
@@ -1693,157 +2862,26 @@ class _SplashScreenState extends State<SplashScreen> {
           ),
         ),
         child: SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 24),
+          child: Center(
             child: Column(
+              mainAxisSize: MainAxisSize.min,
               children: [
-                const Spacer(),
-                Container(
-                  width: 76,
-                  height: 76,
-                  decoration: BoxDecoration(
-                    color: Colors.white,
-                    borderRadius: BorderRadius.circular(18),
-                    border: Border.all(color: const Color(0xFFD7E0EA)),
-                    boxShadow: [
-                      BoxShadow(
-                        color: Colors.black.withValues(alpha: 0.04),
-                        blurRadius: 20,
-                        offset: const Offset(0, 7),
-                      ),
-                    ],
-                  ),
-                  child: const Icon(
-                    Icons.shield,
-                    size: 40,
-                    color: AppColors.primary,
-                  ),
-                ),
-                const SizedBox(height: 28),
-                const Text.rich(
-                  TextSpan(
-                    text: 'Sun-Dry ',
-                    style: TextStyle(
-                      fontSize: 26,
-                      fontWeight: FontWeight.w700,
-                      color: AppColors.textMain,
-                    ),
-                    children: [
-                      TextSpan(
-                        text: 'Smart Dock',
-                        style: TextStyle(color: AppColors.primary),
-                      ),
-                    ],
-                  ),
-                ),
-                const SizedBox(height: 8),
+                const SilongLogoImage(width: 220, height: 220),
+                const SizedBox(height: 18),
                 const Text(
-                  'Smart Protection for\nDaing/Tuyo Drying',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(fontSize: 18, color: AppColors.textMuted),
+                  'Preparing your account',
+                  style: TextStyle(color: AppColors.textMuted, fontSize: 16),
                 ),
-                const SizedBox(height: 64),
-                Row(
-                  children: [
-                    Expanded(
-                      child: Text(
-                        'INITIALIZING SYSTEM',
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          fontWeight: FontWeight.w700,
-                          letterSpacing: 1,
-                          color: Color(0xFF6E7F9F),
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    Text(
-                      '$percent%',
-                      style: const TextStyle(
-                        fontWeight: FontWeight.w700,
-                        color: AppColors.primary,
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 10),
-                ClipRRect(
-                  borderRadius: BorderRadius.circular(8),
-                  child: LinearProgressIndicator(
-                    value: _progress.clamp(0, 1),
-                    minHeight: 6,
-                    color: AppColors.primary,
-                    backgroundColor: const Color(0xFFD8E0EC),
-                  ),
-                ),
-                const SizedBox(height: 26),
-                Wrap(
-                  alignment: WrapAlignment.center,
-                  spacing: 8,
-                  runSpacing: 8,
-                  children: const [
-                    _PillTag(label: 'SENSORS ONLINE'),
-                    _PillTag(label: 'CLOUD LINKED'),
-                  ],
-                ),
-                const Spacer(),
-                const Padding(
-                  padding: EdgeInsets.only(bottom: 12),
-                  child: Text(
-                    'VERSION 2.4.0  •  SECURED BY SUN-DRY',
-                    textAlign: TextAlign.center,
-                    maxLines: 2,
-                    softWrap: true,
-                    style: TextStyle(
-                      color: Color(0xFF8C9AB2),
-                      letterSpacing: 1.0,
-                      fontWeight: FontWeight.w700,
-                    ),
-                  ),
+                const SizedBox(height: 20),
+                const SizedBox(
+                  width: 24,
+                  height: 24,
+                  child: CircularProgressIndicator(strokeWidth: 2),
                 ),
               ],
             ),
           ),
         ),
-      ),
-    );
-  }
-}
-
-class _PillTag extends StatelessWidget {
-  const _PillTag({required this.label});
-
-  final String label;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(20),
-        border: Border.all(color: const Color(0xFFD9E1EC)),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          const Icon(
-            Icons.check_circle_outline,
-            size: 14,
-            color: AppColors.primary,
-          ),
-          const SizedBox(width: 6),
-          Text(
-            label,
-            style: const TextStyle(
-              fontSize: 11,
-              fontWeight: FontWeight.w700,
-              letterSpacing: 0.7,
-              color: Color(0xFF62748F),
-            ),
-          ),
-        ],
       ),
     );
   }
@@ -1929,7 +2967,7 @@ class _LoginScreenState extends State<LoginScreen> {
                       const SizedBox(height: 16),
                       Center(
                         child: Text(
-                          'Sun-Dry',
+                          'SILONG',
                           style: TextStyle(
                             fontSize: titleSize,
                             fontWeight: FontWeight.w700,
@@ -1969,21 +3007,6 @@ class _LoginScreenState extends State<LoginScreen> {
                             ),
                           ),
                           const Spacer(),
-                          TextButton(
-                            onPressed: () {},
-                            style: TextButton.styleFrom(
-                              minimumSize: Size.zero,
-                              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                              padding: EdgeInsets.zero,
-                            ),
-                            child: const Text(
-                              'Forgot Password?',
-                              style: TextStyle(
-                                color: AppColors.primary,
-                                fontWeight: FontWeight.w700,
-                              ),
-                            ),
-                          ),
                         ],
                       ),
                       const SizedBox(height: 6),
@@ -2056,7 +3079,7 @@ class _LoginScreenState extends State<LoginScreen> {
                         crossAxisAlignment: WrapCrossAlignment.center,
                         children: [
                           const Text(
-                            'New to Sun-Dry? ',
+                            'New to SILONG? ',
                             style: TextStyle(color: Color(0xFF8A98AE)),
                           ),
                           TextButton(
@@ -2288,7 +3311,7 @@ class _RegisterScreenState extends State<RegisterScreen> {
           padding: const EdgeInsets.all(16),
           children: [
             const Text(
-              'Register a new account to sign in to Sun-Dry.',
+              'Register a new account to sign in to SILONG.',
               style: TextStyle(fontSize: 16, color: AppColors.textMuted),
             ),
             const SizedBox(height: 16),
@@ -2662,10 +3685,9 @@ class _SetLocationScreenState extends State<SetLocationScreen> {
                 ),
               const SizedBox(height: 12),
               OutlinedButton.icon(
-                onPressed:
-                    _isSavingLocation || _isResolvingGps
-                        ? null
-                        : () => _autoDetectLocation(showErrors: true),
+                onPressed: _isSavingLocation || _isResolvingGps
+                    ? null
+                    : () => _autoDetectLocation(showErrors: true),
                 icon: const Icon(Icons.my_location, color: AppColors.primary),
                 label: Text(
                   _isResolvingGps ? 'Locating...' : 'Use Current GPS',
@@ -2704,36 +3726,6 @@ class _SetLocationScreenState extends State<SetLocationScreen> {
               _buildProvinceDropdown(),
               const SizedBox(height: 12),
               _buildCityDropdown(),
-              const SizedBox(height: 10),
-              Container(
-                padding: const EdgeInsets.all(10),
-                decoration: BoxDecoration(
-                  color: const Color(0xFFEFF6FF),
-                  borderRadius: BorderRadius.circular(10),
-                  border: Border.all(color: const Color(0xFFCFE0F8)),
-                ),
-                child: const Row(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Icon(
-                      Icons.info_outline,
-                      color: AppColors.accentBlue,
-                      size: 18,
-                    ),
-                    SizedBox(width: 8),
-                    Expanded(
-                      child: Text(
-                        'Coordinates are set from GPS when available, or from your selected city, for OpenWeather API requests.',
-                        style: TextStyle(
-                          fontSize: 12,
-                          color: Color(0xFF415B7E),
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
               const SizedBox(height: 18),
               FilledButton.icon(
                 onPressed: _isSavingLocation ? null : _saveLocation,
@@ -2968,15 +3960,15 @@ class _SetLocationScreenState extends State<SetLocationScreen> {
   }
 
   bool _gpsMatchesSelection(AppLocation gpsLocation) {
-    final selectedProvince = _selectedProvinceName?.trim().toLowerCase();
-    final selectedCity = _selectedMunicipality?.trim().toLowerCase();
+    final selectedProvince = _normalizeLocationName(_selectedProvinceName);
+    final selectedCity = _normalizeLocationName(_selectedMunicipality);
     if ((selectedProvince == null || selectedProvince.isEmpty) &&
         (selectedCity == null || selectedCity.isEmpty)) {
       return true;
     }
 
-    final gpsProvince = gpsLocation.province?.trim().toLowerCase() ?? '';
-    final gpsCity = gpsLocation.city?.trim().toLowerCase() ?? '';
+    final gpsProvince = _normalizeLocationName(gpsLocation.province) ?? '';
+    final gpsCity = _normalizeLocationName(gpsLocation.city) ?? '';
 
     final provinceMatches =
         selectedProvince == null ||
@@ -2990,6 +3982,86 @@ class _SetLocationScreenState extends State<SetLocationScreen> {
         selectedCity.contains(gpsCity);
 
     return provinceMatches && cityMatches;
+  }
+
+  String? _normalizeLocationName(String? value) {
+    final text = value
+        ?.toLowerCase()
+        .replaceAll(RegExp(r'\b(province|city|municipality|of)\b'), ' ')
+        .replaceAll(RegExp(r'[^a-z0-9]+'), ' ')
+        .trim();
+    if (text == null || text.isEmpty) {
+      return null;
+    }
+    return text.replaceAll(RegExp(r'\s+'), ' ');
+  }
+
+  bool _namesMatch(String? left, String? right) {
+    final a = _normalizeLocationName(left);
+    final b = _normalizeLocationName(right);
+    if (a == null || b == null) {
+      return false;
+    }
+    return a == b || a.contains(b) || b.contains(a);
+  }
+
+  Future<({String? street, String? province, String? city})?>
+  _reverseGeocodeWithNominatim({
+    required double latitude,
+    required double longitude,
+  }) async {
+    final uri = Uri.https('nominatim.openstreetmap.org', '/reverse', {
+      'lat': latitude.toString(),
+      'lon': longitude.toString(),
+      'format': 'jsonv2',
+      'addressdetails': '1',
+      'zoom': '18',
+    });
+
+    final response = await http.get(
+      uri,
+      headers: const <String, String>{
+        'User-Agent': 'sun-daing-dry-mobile/1.0 (gps-location-setup)',
+      },
+    );
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      return null;
+    }
+
+    final decoded = jsonDecode(response.body);
+    if (decoded is! Map<String, dynamic>) {
+      return null;
+    }
+    final address = decoded['address'];
+    if (address is! Map) {
+      return null;
+    }
+    final row = address.map((key, value) => MapEntry(key.toString(), value));
+    final street = _pickFirstNonEmpty([
+      row['road']?.toString(),
+      row['suburb']?.toString(),
+      row['quarter']?.toString(),
+      row['neighbourhood']?.toString(),
+      row['village']?.toString(),
+    ]);
+    final province = _pickFirstNonEmpty([
+      row['state']?.toString(),
+      row['province']?.toString(),
+      row['county']?.toString(),
+    ]);
+    final city = _pickFirstNonEmpty([
+      row['city']?.toString(),
+      row['town']?.toString(),
+      row['municipality']?.toString(),
+      row['village']?.toString(),
+      row['suburb']?.toString(),
+      row['county']?.toString(),
+    ]);
+    return (
+      street: street.isEmpty ? null : street,
+      province: province.isEmpty ? null : province,
+      city: city.isEmpty ? null : city,
+    );
   }
 
   Future<void> _applyGpsSelection({
@@ -3076,41 +4148,44 @@ class _SetLocationScreenState extends State<SetLocationScreen> {
         position.longitude,
       );
       final placemark = placemarks.isNotEmpty ? placemarks.first : null;
+      final reverse = await _reverseGeocodeWithNominatim(
+        latitude: position.latitude,
+        longitude: position.longitude,
+      );
 
-      final street = placemark == null
-          ? ''
-          : _pickFirstNonEmpty([
-              placemark.street,
-              placemark.thoroughfare,
-              placemark.subLocality,
-              placemark.name,
-            ]);
-      final city = placemark == null
-          ? null
-          : _pickFirstNonEmpty([
-              placemark.locality,
-              placemark.subAdministrativeArea,
-              placemark.subLocality,
-            ]);
-      final province = placemark == null
-          ? null
-          : _pickFirstNonEmpty([
-              placemark.administrativeArea,
-              placemark.subAdministrativeArea,
-            ]);
+      final street = _pickFirstNonEmpty([
+        reverse?.street,
+        placemark?.street,
+        placemark?.thoroughfare,
+        placemark?.subLocality,
+        placemark?.name,
+      ]);
+      final city = _pickFirstNonEmpty([
+        reverse?.city,
+        placemark?.locality,
+        placemark?.subLocality,
+        placemark?.subAdministrativeArea,
+      ]);
+      final province = _pickFirstNonEmpty([
+        reverse?.province,
+        placemark?.subAdministrativeArea,
+        placemark?.administrativeArea,
+      ]);
+      final cityName = city.isEmpty ? null : city;
+      final provinceName = province.isEmpty ? null : province;
 
       final label = _buildLocationLabel(
         street: street,
-        city: city,
-        province: province,
+        city: cityName,
+        province: provinceName,
       );
       final gpsLocation = AppLocation(
         label: label,
         latitude: position.latitude,
         longitude: position.longitude,
         street: street,
-        province: province,
-        city: city,
+        province: provinceName,
+        city: cityName,
       );
 
       if (!mounted) {
@@ -3120,7 +4195,7 @@ class _SetLocationScreenState extends State<SetLocationScreen> {
       setState(() {
         _gpsLocation = gpsLocation;
         _gpsStatusMessage =
-            'GPS detected near ${city ?? province ?? 'your area'}.';
+            'GPS detected near ${cityName ?? provinceName ?? 'your area'}.';
       });
 
       final shouldApply = !_hasManualEdits || showErrors;
@@ -3129,7 +4204,7 @@ class _SetLocationScreenState extends State<SetLocationScreen> {
         if (street.isNotEmpty) {
           _streetController.text = street;
         }
-        await _applyGpsSelection(province: province, city: city);
+        await _applyGpsSelection(province: provinceName, city: cityName);
         _hasManualEdits = false;
       } else {
         setState(() {
@@ -3180,11 +4255,14 @@ class _SetLocationScreenState extends State<SetLocationScreen> {
       AppLocation location;
 
       if (canUseGps) {
-        final effectiveStreet =
-            street.isNotEmpty ? street : (gpsLocation?.street ?? '');
-        final effectiveProvince = province ?? gpsLocation?.province;
+        final effectiveStreet = street.isNotEmpty
+            ? street
+            : (gpsLocation.street ?? '');
+        final effectiveProvince = province ?? gpsLocation.province;
         final effectiveCity =
-            municipality?.displayName ?? _selectedMunicipality ?? gpsLocation?.city;
+            municipality?.displayName ??
+            _selectedMunicipality ??
+            gpsLocation.city;
 
         if (effectiveStreet.isEmpty ||
             effectiveProvince == null ||
@@ -3202,30 +4280,36 @@ class _SetLocationScreenState extends State<SetLocationScreen> {
         );
         location = AppLocation(
           label: label,
-          latitude: gpsLocation!.latitude,
+          latitude: gpsLocation.latitude,
           longitude: gpsLocation.longitude,
           street: effectiveStreet,
           province: effectiveProvince,
           city: effectiveCity,
         );
       } else {
+        final selectedMunicipality = municipality;
+        final selectedProvince = province;
+        if (selectedMunicipality == null || selectedProvince == null) {
+          _showMessage('Enter street, select province, and select city.');
+          return;
+        }
         final coordinates = await OpenWeatherService.geocodePhilippineLocation(
-          municipality: municipality!.queryName,
-          province: province!,
+          municipality: selectedMunicipality.queryName,
+          province: selectedProvince,
         );
 
         final label = _buildLocationLabel(
           street: street,
-          city: municipality.displayName,
-          province: province,
+          city: selectedMunicipality.displayName,
+          province: selectedProvince,
         );
         location = AppLocation(
           label: label,
           latitude: coordinates.$1,
           longitude: coordinates.$2,
           street: street,
-          province: province,
-          city: municipality.displayName,
+          province: selectedProvince,
+          city: selectedMunicipality.displayName,
         );
       }
 
@@ -3294,9 +4378,12 @@ class _SetLocationScreenState extends State<SetLocationScreen> {
     if (name == null || name.trim().isEmpty) {
       return null;
     }
-    final normalized = name.trim().toLowerCase();
+    final normalized = _normalizeLocationName(name);
     for (final province in _provinceOptions) {
-      if (province.name.toLowerCase() == normalized) {
+      final provinceName = _normalizeLocationName(province.name);
+      if (provinceName == normalized ||
+          (provinceName?.contains(normalized ?? '') ?? false) ||
+          (normalized?.contains(provinceName ?? '') ?? false)) {
         return province;
       }
     }
@@ -3337,9 +4424,8 @@ class _SetLocationScreenState extends State<SetLocationScreen> {
 
       String? selectedName;
       if (preselectedMunicipality != null) {
-        final normalized = preselectedMunicipality.trim().toLowerCase();
         for (final option in municipalities) {
-          if (option.displayName.toLowerCase() == normalized) {
+          if (_namesMatch(option.displayName, preselectedMunicipality)) {
             selectedName = option.displayName;
             break;
           }
@@ -3381,37 +4467,190 @@ class _MainNavigationShellState extends State<MainNavigationShell> {
   bool _isWeatherLoading = false;
   String? _weatherError;
   DateTime? _lastWeatherSyncAt;
+  int _rainProbabilityThreshold = ThresholdStore.defaultRainProbability;
+  bool _thresholdCommandSentForCurrentRisk = false;
+  String _firstName = 'User';
+  RackMovementAnalytics? _movementAnalytics;
+  HardwareService? _movementObserverService;
+  HardwareState? _lastObservedHardwareState;
 
   @override
   void initState() {
     super.initState();
     _location = widget.initialLocation;
+    unawaited(_loadThreshold());
+    unawaited(_loadFirstName());
+    unawaited(_loadMovementAnalytics());
+    _startMovementObserver();
     _refreshWeather();
+  }
+
+  @override
+  void dispose() {
+    _movementObserverService?.dispose();
+    super.dispose();
+  }
+
+  Future<void> _loadMovementAnalytics() async {
+    final analytics = await RackMovementStore.load();
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _movementAnalytics = analytics;
+    });
+  }
+
+  Future<void> _loadFirstName() async {
+    final firstName = await loadCurrentUserFirstName();
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _firstName = firstName;
+    });
+  }
+
+  Future<void> _loadThreshold() async {
+    final threshold = await ThresholdStore.loadRainProbability();
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _rainProbabilityThreshold = threshold;
+    });
+    await _evaluateRainThresholdAutomation();
+  }
+
+  void _startMovementObserver() {
+    if (!_supabaseInitialized) {
+      return;
+    }
+    final ownerEmail =
+        Supabase.instance.client.auth.currentUser?.email
+            ?.trim()
+            .toLowerCase() ??
+        '';
+    if (ownerEmail.isEmpty) {
+      return;
+    }
+
+    _movementObserverService = HardwareService(
+      Supabase.instance.client,
+      deviceId: 'ESP32_RACK_01',
+      ownerEmail: ownerEmail,
+    );
+    _movementObserverService!.subscribe(_handleHardwareObservation);
+  }
+
+  void _handleHardwareObservation(HardwareState state) {
+    final previous = _lastObservedHardwareState;
+    _lastObservedHardwareState = state;
+    final obstructionEventChanged =
+        state.obstructionEventAt != null &&
+        (previous == null
+            ? DateTime.now().difference(state.obstructionEventAt!.toLocal()) <=
+                  const Duration(minutes: 5)
+            : state.obstructionEventAt != previous.obstructionEventAt);
+    if (obstructionEventChanged) {
+      unawaited(
+        _recordHardwareSafetyAlert(
+          'OBSTRUCTED',
+          eventAt: state.obstructionEventAt,
+        ),
+      );
+    } else if (isRackSafetyStatus(state.rackStatus) &&
+        (previous == null || previous.rackStatus != state.rackStatus)) {
+      unawaited(_recordHardwareSafetyAlert(state.rackStatus));
+    }
+    if (previous == null) {
+      return;
+    }
+    if (!isRackMovingStatus(previous.rackStatus) ||
+        isRackMovingStatus(state.rackStatus)) {
+      return;
+    }
+
+    final action = rackActionFromStatus(state.rackStatus);
+    if (action == null) {
+      return;
+    }
+    if (HardwareService.hasRecentAppCommandForAction(action)) {
+      unawaited(_completeObservedMovement(action));
+      return;
+    }
+
+    final trigger = state.isRaining && action == 'EXTEND'
+        ? 'RAIN_SENSOR'
+        : (!state.isRaining && action == 'RETRACT'
+              ? 'WEATHER_THRESHOLD'
+              : 'SYSTEM');
+    unawaited(_recordObservedMovement(action, trigger));
+  }
+
+  Future<void> _completeObservedMovement(String action) async {
+    await RackMovementStore.completePending(action);
+    await _loadMovementAnalytics();
+  }
+
+  Future<void> _recordObservedMovement(String action, String trigger) async {
+    await RackMovementStore.record(
+      action: action,
+      trigger: trigger,
+      mode: 'AUTO',
+    );
+    await _loadMovementAnalytics();
+  }
+
+  Future<void> _recordHardwareSafetyAlert(
+    String status, {
+    DateTime? eventAt,
+  }) async {
+    final timestamp = eventAt ?? DateTime.now();
+    final alert = SavedAlert(
+      id: 'hardware-safety-${timestamp.microsecondsSinceEpoch}',
+      type: 'safety',
+      title: rackSafetyTitle(status),
+      body: rackSafetyBody(status),
+      timestamp: timestamp,
+      rightLabel: 'SAFETY',
+    );
+    final inserted = await AlertStore.saveAlert(alert);
+    if (inserted) {
+      await PushNotificationService.show(
+        title: rackSafetyTitle(status),
+        body: rackSafetyBody(status),
+      );
+    }
   }
 
   @override
   Widget build(BuildContext context) {
     final pages = [
       HomeScreen(
-        onOpenManualControl: _openManualControl,
         onOpenDashboard: () => setState(() => _index = 1),
+        onOpenAlerts: () => setState(() => _index = 3),
         location: _location,
         weather: _weather,
         isWeatherLoading: _isWeatherLoading,
         weatherError: _weatherError,
         onRefreshWeather: _refreshWeather,
+        firstName: _firstName,
+        movementAnalytics: _movementAnalytics,
       ),
       DashboardScreen(
         onOpenHistory: _openActivityHistory,
         location: _location,
         weather: _weather,
         lastWeatherSyncAt: _lastWeatherSyncAt,
+        movementAnalytics: _movementAnalytics,
       ),
       DeviceScreen(
-        onOpenManualControl: _openLiveConsoleManual,
+        onOpenManualControl: _openManualControl,
         location: _location,
         weather: _weather,
         lastWeatherSyncAt: _lastWeatherSyncAt,
+        movementAnalytics: _movementAnalytics,
       ),
       AlertsScreen(
         weather: _weather,
@@ -3428,39 +4667,48 @@ class _MainNavigationShellState extends State<MainNavigationShell> {
 
     return Scaffold(
       body: pages[_index],
-      bottomNavigationBar: NavigationBar(
-        selectedIndex: _index,
-        onDestinationSelected: (value) => setState(() => _index = value),
-        height: 74,
-        labelBehavior: NavigationDestinationLabelBehavior.alwaysShow,
-        backgroundColor: Colors.white,
-        destinations: const [
-          NavigationDestination(
-            icon: Icon(Icons.home_outlined),
-            selectedIcon: Icon(Icons.home),
-            label: 'HOME',
+      bottomNavigationBar: NavigationBarTheme(
+        data: NavigationBarThemeData(
+          labelTextStyle: WidgetStatePropertyAll(
+            Theme.of(
+              context,
+            ).textTheme.labelSmall?.copyWith(fontSize: 10, height: 1),
           ),
-          NavigationDestination(
-            icon: Icon(Icons.grid_view_outlined),
-            selectedIcon: Icon(Icons.grid_view),
-            label: 'DASHBOARD',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.memory_outlined),
-            selectedIcon: Icon(Icons.memory),
-            label: 'DEVICE',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.notifications_none),
-            selectedIcon: Icon(Icons.notifications),
-            label: 'ALERTS',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.settings_outlined),
-            selectedIcon: Icon(Icons.settings),
-            label: 'SETTINGS',
-          ),
-        ],
+        ),
+        child: NavigationBar(
+          selectedIndex: _index,
+          onDestinationSelected: (value) => setState(() => _index = value),
+          height: 74,
+          labelBehavior: NavigationDestinationLabelBehavior.alwaysShow,
+          backgroundColor: Colors.white,
+          destinations: const [
+            NavigationDestination(
+              icon: Icon(Icons.home_outlined),
+              selectedIcon: Icon(Icons.home),
+              label: 'HOME',
+            ),
+            NavigationDestination(
+              icon: Icon(Icons.grid_view_outlined),
+              selectedIcon: Icon(Icons.grid_view),
+              label: 'DASHBOARD',
+            ),
+            NavigationDestination(
+              icon: Icon(Icons.memory_outlined),
+              selectedIcon: Icon(Icons.memory),
+              label: 'DEVICE',
+            ),
+            NavigationDestination(
+              icon: Icon(Icons.notifications_none),
+              selectedIcon: Icon(Icons.notifications),
+              label: 'ALERTS',
+            ),
+            NavigationDestination(
+              icon: Icon(Icons.settings_outlined),
+              selectedIcon: Icon(Icons.settings),
+              label: 'SETTINGS',
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -3471,19 +4719,12 @@ class _MainNavigationShellState extends State<MainNavigationShell> {
     ).push(MaterialPageRoute(builder: (_) => const ManualOverrideScreen()));
   }
 
-  void _openLiveConsoleManual() {
-    Navigator.of(
-      context,
-    ).push(MaterialPageRoute(builder: (_) => const ManualOverrideLiveScreen()));
-  }
-
   void _openActivityHistory() {
     Navigator.of(context).push(
       MaterialPageRoute(
         builder: (_) => ActivityHistoryScreen(
           location: _location,
-          weather: _weather,
-          lastWeatherSyncAt: _lastWeatherSyncAt,
+          movementAnalytics: _movementAnalytics,
         ),
       ),
     );
@@ -3491,7 +4732,19 @@ class _MainNavigationShellState extends State<MainNavigationShell> {
 
   void _openThresholdConfig() {
     Navigator.of(context).push(
-      MaterialPageRoute(builder: (_) => const ThresholdConfigurationScreen()),
+      MaterialPageRoute(
+        builder: (_) => ThresholdConfigurationScreen(
+          weather: _weather,
+          initialThreshold: _rainProbabilityThreshold,
+          onSaved: (threshold) async {
+            setState(() {
+              _rainProbabilityThreshold = threshold;
+              _thresholdCommandSentForCurrentRisk = false;
+            });
+            await _evaluateRainThresholdAutomation();
+          },
+        ),
+      ),
     );
   }
 
@@ -3529,15 +4782,15 @@ class _MainNavigationShellState extends State<MainNavigationShell> {
         _weather = weather;
         _lastWeatherSyncAt = DateTime.now();
       });
+      await _recordWeatherAlert(weather);
+      await _evaluateRainThresholdAutomation();
+      await _loadMovementAnalytics();
     } catch (error) {
       if (!mounted) {
         return;
       }
-      final message = error.toString().replaceFirst('Bad state: ', '').trim();
       setState(() {
-        _weatherError = message.isEmpty
-            ? 'Weather sync failed. Please check your internet and try again.'
-            : message;
+        _weatherError = _weatherSyncErrorMessage(error);
       });
     } finally {
       if (mounted) {
@@ -3546,6 +4799,138 @@ class _MainNavigationShellState extends State<MainNavigationShell> {
         });
       }
     }
+  }
+
+  Future<void> _evaluateRainThresholdAutomation() async {
+    final weather = _weather;
+    if (weather == null) {
+      _thresholdCommandSentForCurrentRisk = false;
+      return;
+    }
+    final isHighRisk = weather.rainProbability >= _rainProbabilityThreshold;
+    if (!isHighRisk) {
+      if (_thresholdCommandSentForCurrentRisk) {
+        await _sendAutoRetractCommand(weather);
+      }
+      _thresholdCommandSentForCurrentRisk = false;
+      return;
+    }
+    if (_thresholdCommandSentForCurrentRisk || !_supabaseInitialized) {
+      return;
+    }
+    final ownerEmail =
+        Supabase.instance.client.auth.currentUser?.email
+            ?.trim()
+            .toLowerCase() ??
+        '';
+    if (ownerEmail.isEmpty) {
+      return;
+    }
+    try {
+      final service = HardwareService(
+        Supabase.instance.client,
+        deviceId: 'ESP32_RACK_01',
+        ownerEmail: ownerEmail,
+      );
+      await service.sendCommand('DEPLOY');
+      HardwareService.noteAppCommandIssued('DEPLOY');
+      _thresholdCommandSentForCurrentRisk = true;
+      await _recordAutomationAlert(weather);
+    } catch (_) {
+      // Keep weather refresh usable even if the hardware command cannot be sent.
+    }
+  }
+
+  Future<void> _sendAutoRetractCommand(WeatherSnapshot weather) async {
+    if (!_supabaseInitialized) {
+      return;
+    }
+    final ownerEmail =
+        Supabase.instance.client.auth.currentUser?.email
+            ?.trim()
+            .toLowerCase() ??
+        '';
+    if (ownerEmail.isEmpty) {
+      return;
+    }
+
+    try {
+      final service = HardwareService(
+        Supabase.instance.client,
+        deviceId: 'ESP32_RACK_01',
+        ownerEmail: ownerEmail,
+      );
+      await service.sendCommand('RETRACT');
+      HardwareService.noteAppCommandIssued('RETRACT');
+      await _recordAutomationRetractAlert(weather);
+    } catch (_) {
+      // Keep weather refresh usable even if the hardware command cannot be sent.
+    }
+  }
+
+  Future<void> _recordWeatherAlert(WeatherSnapshot weather) async {
+    final now = DateTime.now();
+    final highRisk = weather.rainProbability >= _rainProbabilityThreshold;
+    final alert = SavedAlert(
+      id: 'weather-${now.year}-${now.month}-${now.day}-${now.hour}-$_rainProbabilityThreshold-${highRisk ? 'high' : 'normal'}',
+      type: highRisk ? 'rain_high' : 'rain_normal',
+      title: highRisk
+          ? 'High rain probability detected (${weather.rainProbability}%)'
+          : 'Rain risk normal for ${_location.city ?? _location.province ?? 'your area'}',
+      body:
+          'Near-term forecast: ${weather.rainProbability}% rain probability for ${_location.label}.',
+      timestamp: now,
+    );
+    final inserted = await AlertStore.saveAlert(alert);
+    if (inserted && highRisk) {
+      await PushNotificationService.show(title: alert.title, body: alert.body);
+    }
+  }
+
+  Future<void> _recordAutomationAlert(WeatherSnapshot weather) async {
+    final now = DateTime.now();
+    final alert = SavedAlert(
+      id: 'automation-deploy-${now.year}-${now.month}-${now.day}-${now.hour}-${weather.rainProbability}-$_rainProbabilityThreshold',
+      type: 'rack_deploy',
+      title: 'Rack protection command sent',
+      body:
+          'Rain probability reached ${weather.rainProbability}%, so SILONG sent DEPLOY to extend the rack.',
+      timestamp: now,
+      rightLabel: 'AUTO',
+    );
+    final inserted = await AlertStore.saveAlert(alert);
+    if (inserted) {
+      await PushNotificationService.show(title: alert.title, body: alert.body);
+    }
+    await RackMovementStore.record(
+      action: 'EXTEND',
+      trigger: 'WEATHER_THRESHOLD',
+      mode: 'AUTO',
+      status: 'REQUESTED',
+    );
+  }
+
+  Future<void> _recordAutomationRetractAlert(WeatherSnapshot weather) async {
+    final now = DateTime.now();
+    final alert = SavedAlert(
+      id: 'automation-retract-${now.year}-${now.month}-${now.day}-${now.hour}-${weather.rainProbability}-$_rainProbabilityThreshold',
+      type: 'rack_retract',
+      title: 'Rack protection cleared',
+      body:
+          'Rain probability dropped to ${weather.rainProbability}%, so SILONG sent RETRACT to bring the rack back.',
+      timestamp: now,
+      rightLabel: 'AUTO',
+    );
+    final inserted = await AlertStore.saveAlert(alert);
+    if (inserted) {
+      await PushNotificationService.show(title: alert.title, body: alert.body);
+    }
+    await RackMovementStore.record(
+      action: 'RETRACT',
+      trigger: 'WEATHER_THRESHOLD',
+      mode: 'AUTO',
+      status: 'REQUESTED',
+    );
   }
 
   Future<void> _signOut() async {
@@ -3572,29 +4957,31 @@ class HomeScreen extends StatelessWidget {
   const HomeScreen({
     super.key,
     required this.onOpenDashboard,
-    required this.onOpenManualControl,
+    required this.onOpenAlerts,
     required this.location,
     required this.weather,
     required this.isWeatherLoading,
     required this.weatherError,
     required this.onRefreshWeather,
+    required this.firstName,
+    required this.movementAnalytics,
   });
 
   final VoidCallback onOpenDashboard;
-  final VoidCallback onOpenManualControl;
+  final VoidCallback onOpenAlerts;
   final AppLocation location;
   final WeatherSnapshot? weather;
   final bool isWeatherLoading;
   final String? weatherError;
   final Future<void> Function() onRefreshWeather;
+  final String firstName;
+  final RackMovementAnalytics? movementAnalytics;
 
   @override
   Widget build(BuildContext context) {
-    final headline = rs(context, 31, min: 24);
     final greeting = rs(context, 48, min: 34);
     final sectionTitle = rs(context, 32, min: 24);
     final buttonText = rs(context, 26, min: 20);
-    final secondaryButtonText = rs(context, 24, min: 18);
 
     return AppViewport(
       child: SafeArea(
@@ -3603,35 +4990,13 @@ class HomeScreen extends StatelessWidget {
           children: [
             Row(
               children: [
-                CircleAvatar(
-                  radius: 16,
-                  backgroundColor: const Color(
-                    0xFF1B9890,
-                  ).withValues(alpha: 0.24),
-                  child: const Icon(Icons.person, color: AppColors.textMain),
-                ),
+                const SilongLogoImage(width: 112, height: 44),
                 const SizedBox(width: 10),
-                Expanded(
-                  child: Text(
-                    'Sun-Dry',
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      fontSize: headline,
-                      fontWeight: FontWeight.w700,
-                      color: AppColors.textMain,
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                Container(
-                  width: 38,
-                  height: 38,
-                  decoration: BoxDecoration(
-                    color: const Color(0xFFEAF0F6),
-                    borderRadius: BorderRadius.circular(11),
-                  ),
-                  child: const Icon(
+                const Spacer(),
+                IconButton(
+                  onPressed: onOpenAlerts,
+                  tooltip: 'Open alerts',
+                  icon: const Icon(
                     Icons.notifications_none,
                     color: AppColors.textMain,
                   ),
@@ -3644,7 +5009,7 @@ class HomeScreen extends StatelessWidget {
               style: TextStyle(fontSize: 18, color: Color(0xFF77859E)),
             ),
             Text(
-              'Hello, User',
+              'Hello, $firstName',
               style: TextStyle(
                 fontSize: greeting,
                 fontWeight: FontWeight.w700,
@@ -3690,13 +5055,17 @@ class HomeScreen extends StatelessWidget {
               ),
             _buildStatusCard(context),
             const SizedBox(height: 14),
+            _PredictiveAnalyticsCard(weather: weather, location: location),
+            const SizedBox(height: 14),
+            _RackMovementSummaryCard(analytics: movementAnalytics),
+            const SizedBox(height: 14),
             Row(
               children: [
                 Expanded(
                   child: _MetricCard(
                     title: 'TEMP',
                     value: weather?.temperatureFText ?? '--',
-                    subtitle: 'Indoor average',
+                    subtitle: 'Outdoor forecast',
                     icon: Icons.thermostat_outlined,
                   ),
                 ),
@@ -3737,32 +5106,6 @@ class HomeScreen extends StatelessWidget {
                 ],
               ),
             ),
-            const SizedBox(height: 8),
-            OutlinedButton(
-              style: OutlinedButton.styleFrom(
-                side: const BorderSide(color: Color(0xFFD2DBE8)),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                padding: const EdgeInsets.symmetric(vertical: 14),
-              ),
-              onPressed: onOpenManualControl,
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  const Icon(Icons.info_outline, color: AppColors.textMain),
-                  const SizedBox(width: 8),
-                  Text(
-                    'Manual Control',
-                    style: TextStyle(
-                      fontSize: secondaryButtonText,
-                      color: AppColors.textMain,
-                      fontWeight: FontWeight.w700,
-                    ),
-                  ),
-                ],
-              ),
-            ),
             const SizedBox(height: 20),
             Text(
               'Quick Stats',
@@ -3787,17 +5130,6 @@ class HomeScreen extends StatelessWidget {
                   ? AppColors.danger
                   : AppColors.success,
             ),
-            const SizedBox(height: 20),
-            Text(
-              'Predictive Analytics',
-              style: TextStyle(
-                fontSize: sectionTitle,
-                fontWeight: FontWeight.w700,
-                color: AppColors.textMain,
-              ),
-            ),
-            const SizedBox(height: 10),
-            _PredictiveAnalyticsCard(weather: weather, location: location),
           ],
         ),
       ),
@@ -3807,11 +5139,18 @@ class HomeScreen extends StatelessWidget {
   Widget _buildStatusCard(BuildContext context) {
     final safeText = rs(context, 52, min: 36);
     final isForecastReady = weather != null;
+    final isRainRisk = (weather?.rainProbability ?? 0) >= 60;
+    final statusColor = isRainRisk ? AppColors.danger : AppColors.success;
+    final statusLabel = !isForecastReady
+        ? 'Waiting'
+        : (isRainRisk ? 'Rain Risk' : 'Monitoring');
     final statusCopy = isForecastReady
         ? 'Forecast data from ${weather!.source} is active.'
         : 'Forecast pipeline is initializing. No hardware sensor stream yet.';
-    final progress = isForecastReady ? 1.0 : 0.62;
-    final progressLabel = isForecastReady ? 'Forecast Ready' : 'Syncing';
+    final progress = isRainRisk ? 0.35 : (isForecastReady ? 1.0 : 0.0);
+    final progressLabel = isRainRisk
+        ? 'Rain Risk'
+        : (isForecastReady ? 'Forecast Ready' : 'Waiting');
 
     return Container(
       padding: const EdgeInsets.all(16),
@@ -3825,10 +5164,10 @@ class HomeScreen extends StatelessWidget {
         children: [
           Row(
             children: [
-              const Text(
-                'SYSTEM STATUS',
+              Text(
+                'FORECAST STATUS',
                 style: TextStyle(
-                  color: AppColors.success,
+                  color: statusColor,
                   fontWeight: FontWeight.w700,
                   letterSpacing: 2,
                 ),
@@ -3839,16 +5178,19 @@ class HomeScreen extends StatelessWidget {
                 height: 42,
                 decoration: BoxDecoration(
                   shape: BoxShape.circle,
-                  color: const Color(0xFFDCF6EA),
-                  border: Border.all(color: const Color(0xFF88DBC0)),
+                  color: statusColor.withValues(alpha: 0.12),
+                  border: Border.all(color: statusColor.withValues(alpha: 0.4)),
                 ),
-                child: const Icon(Icons.check, color: AppColors.success),
+                child: Icon(
+                  isRainRisk ? Icons.warning_amber_rounded : Icons.cloud_done,
+                  color: statusColor,
+                ),
               ),
             ],
           ),
           const SizedBox(height: 8),
           Text(
-            'Safe',
+            statusLabel,
             style: TextStyle(
               fontSize: safeText,
               fontWeight: FontWeight.w700,
@@ -3868,8 +5210,8 @@ class HomeScreen extends StatelessWidget {
                   child: LinearProgressIndicator(
                     value: progress,
                     minHeight: 6,
-                    color: AppColors.success,
-                    backgroundColor: const Color(0xFFCAE7D7),
+                    color: statusColor,
+                    backgroundColor: statusColor.withValues(alpha: 0.14),
                   ),
                 ),
               ),
@@ -3877,7 +5219,7 @@ class HomeScreen extends StatelessWidget {
               Text(
                 progressLabel,
                 style: TextStyle(
-                  color: AppColors.success.withValues(alpha: 0.96),
+                  color: statusColor.withValues(alpha: 0.96),
                   fontWeight: FontWeight.w700,
                 ),
               ),
@@ -3896,12 +5238,14 @@ class DashboardScreen extends StatelessWidget {
     required this.location,
     required this.weather,
     required this.lastWeatherSyncAt,
+    required this.movementAnalytics,
   });
 
   final VoidCallback onOpenHistory;
   final AppLocation location;
   final WeatherSnapshot? weather;
   final DateTime? lastWeatherSyncAt;
+  final RackMovementAnalytics? movementAnalytics;
 
   @override
   Widget build(BuildContext context) {
@@ -3910,13 +5254,9 @@ class DashboardScreen extends StatelessWidget {
     final sectionHeader = rs(context, 24, min: 18);
     final isWarning = (weather?.rainProbability ?? 0) >= 60;
     final statusLabel = weather == null
-        ? 'Monitoring - Unknown'
-        : (isWarning ? 'Monitoring - Warning' : 'Monitoring - Safe');
-    final activities = buildRecentActivityFeed(
-      location: location,
-      weather: weather,
-      lastWeatherSyncAt: lastWeatherSyncAt,
-    );
+        ? 'Forecast - Loading'
+        : (isWarning ? 'Forecast - Rain Risk' : 'Forecast - Normal');
+    final activities = buildRecentActivityFeed(movementAnalytics);
 
     return AppViewport(
       child: SafeArea(
@@ -3925,11 +5265,9 @@ class DashboardScreen extends StatelessWidget {
           children: [
             Row(
               children: [
-                const Icon(Icons.menu, color: AppColors.textMain),
-                const SizedBox(width: 8),
                 Expanded(
                   child: Text(
-                    'Sun-Dry System',
+                    'SILONG System',
                     textAlign: TextAlign.center,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
@@ -3939,16 +5277,6 @@ class DashboardScreen extends StatelessWidget {
                       color: AppColors.textMain,
                     ),
                   ),
-                ),
-                const SizedBox(width: 8),
-                Container(
-                  width: 38,
-                  height: 38,
-                  decoration: BoxDecoration(
-                    color: const Color(0xFFE6ECF4),
-                    borderRadius: BorderRadius.circular(20),
-                  ),
-                  child: const Icon(Icons.account_circle_outlined),
                 ),
               ],
             ),
@@ -3964,7 +5292,7 @@ class DashboardScreen extends StatelessWidget {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   const Text(
-                    'SYSTEM STATUS',
+                    'FORECAST STATUS',
                     style: TextStyle(
                       letterSpacing: 2,
                       fontWeight: FontWeight.w700,
@@ -3988,6 +5316,8 @@ class DashboardScreen extends StatelessWidget {
                 ],
               ),
             ),
+            const SizedBox(height: 14),
+            _RackMovementAnalyticsCard(analytics: movementAnalytics),
             const SizedBox(height: 18),
             Text(
               'ENVIRONMENTAL METRICS',
@@ -4077,6 +5407,11 @@ class DashboardScreen extends StatelessWidget {
               if (i < math.min(3, activities.length) - 1)
                 const SizedBox(height: 8),
             ],
+            if (activities.isEmpty)
+              const _SimpleInfoTile(
+                title: 'No recent rack movement',
+                trailing: 'No events',
+              ),
           ],
         ),
       ),
@@ -4091,12 +5426,14 @@ class DeviceScreen extends StatefulWidget {
     required this.location,
     required this.weather,
     required this.lastWeatherSyncAt,
+    required this.movementAnalytics,
   });
 
   final VoidCallback onOpenManualControl;
   final AppLocation location;
   final WeatherSnapshot? weather;
   final DateTime? lastWeatherSyncAt;
+  final RackMovementAnalytics? movementAnalytics;
 
   @override
   State<DeviceScreen> createState() => _DeviceScreenState();
@@ -4105,15 +5442,24 @@ class DeviceScreen extends StatefulWidget {
 class _DeviceScreenState extends State<DeviceScreen> {
   HardwareService? _hwService;
   HardwareState? _hwState;
+  Timer? _onlineRefreshTimer;
   bool _isLoading = true;
 
   String _currentOwnerEmail() {
-    return Supabase.instance.client.auth.currentUser?.email?.trim().toLowerCase() ?? '';
+    return Supabase.instance.client.auth.currentUser?.email
+            ?.trim()
+            .toLowerCase() ??
+        '';
   }
 
   @override
   void initState() {
     super.initState();
+    _onlineRefreshTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+      if (mounted) {
+        setState(() {});
+      }
+    });
     if (_supabaseInitialized) {
       final ownerEmail = _currentOwnerEmail();
       if (ownerEmail.isNotEmpty) {
@@ -4137,6 +5483,7 @@ class _DeviceScreenState extends State<DeviceScreen> {
 
   @override
   void dispose() {
+    _onlineRefreshTimer?.cancel();
     _hwService?.dispose();
     super.dispose();
   }
@@ -4146,13 +5493,17 @@ class _DeviceScreenState extends State<DeviceScreen> {
     final titleSize = rs(context, 37, min: 28);
     final networkStateSize = rs(context, 48, min: 34);
     final sensorsTitle = rs(context, 36, min: 26);
+    final secondaryButtonText = rs(context, 24, min: 18);
     final hasWeather = widget.weather != null;
     final sourceLabel = widget.weather?.source ?? 'Weather API';
     final syncLabel = widget.lastWeatherSyncAt == null
         ? 'PENDING'
-        : formatRelativeTime(widget.lastWeatherSyncAt!).replaceFirst('Last checked: ', '').toUpperCase();
+        : formatRelativeTime(
+            widget.lastWeatherSyncAt!,
+          ).replaceFirst('Last checked: ', '').toUpperCase();
 
     final hw = _hwState;
+    final deviceOnline = hw?.isOnline ?? false;
 
     return AppViewport(
       child: SafeArea(
@@ -4165,7 +5516,7 @@ class _DeviceScreenState extends State<DeviceScreen> {
                 const SizedBox(width: 8),
                 Expanded(
                   child: Text(
-                    'Sun-Dry',
+                    'SILONG',
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: TextStyle(
@@ -4173,20 +5524,6 @@ class _DeviceScreenState extends State<DeviceScreen> {
                       fontWeight: FontWeight.w700,
                       color: AppColors.textMain,
                     ),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                InkWell(
-                  onTap: widget.onOpenManualControl,
-                  borderRadius: BorderRadius.circular(20),
-                  child: Container(
-                    width: 40,
-                    height: 40,
-                    decoration: BoxDecoration(
-                      color: const Color(0xFFE9EFF5),
-                      borderRadius: BorderRadius.circular(20),
-                    ),
-                    child: const Icon(Icons.add),
                   ),
                 ),
               ],
@@ -4210,9 +5547,26 @@ class _DeviceScreenState extends State<DeviceScreen> {
                       fontWeight: FontWeight.w700,
                     ),
                   ),
+                  if (deviceOnline && isRackSafetyStatus(hw!.rackStatus))
+                    Container(
+                      margin: const EdgeInsets.only(top: 12),
+                      padding: const EdgeInsets.all(14),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFFFF3E0),
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(color: const Color(0xFFE7B66A)),
+                      ),
+                      child: Text(
+                        rackSafetyBody(hw.rackStatus),
+                        style: const TextStyle(
+                          color: Color(0xFF7A4B00),
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
                   SizedBox(height: 8),
                   Text(
-                    '• ${hw != null ? 'Online' : (_isLoading ? 'Connecting' : 'Offline')}',
+                    '• ${deviceOnline ? 'Online' : (_isLoading ? 'Connecting' : 'Offline')}',
                     style: TextStyle(
                       fontSize: networkStateSize,
                       fontWeight: FontWeight.w700,
@@ -4221,14 +5575,40 @@ class _DeviceScreenState extends State<DeviceScreen> {
                   ),
                   const SizedBox(height: 4),
                   Text(
-                    hw != null
-                        ? 'Device: ${hw.rackStatus} — Auto: ${hw.isAutoMode ? 'ON' : 'OFF'}'
+                    deviceOnline
+                        ? 'Device: ${hw!.rackStatus} — Auto: ${hw.isAutoMode ? 'ON' : 'OFF'}'
                         : (hasWeather
-                            ? '$sourceLabel stream active for ${widget.location.city ?? widget.location.province ?? 'Philippines'}'
-                            : 'Waiting for hardware or weather feed'),
+                              ? '$sourceLabel stream active for ${widget.location.city ?? widget.location.province ?? 'Philippines'}'
+                              : 'Waiting for hardware or weather feed'),
                     style: const TextStyle(
                       fontSize: 19,
                       color: Color(0xFF667E98),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 8),
+            OutlinedButton(
+              style: OutlinedButton.styleFrom(
+                side: const BorderSide(color: Color(0xFFD2DBE8)),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                padding: const EdgeInsets.symmetric(vertical: 14),
+              ),
+              onPressed: widget.onOpenManualControl,
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  const Icon(Icons.info_outline, color: AppColors.textMain),
+                  const SizedBox(width: 8),
+                  Text(
+                    'Manual Control',
+                    style: TextStyle(
+                      fontSize: secondaryButtonText,
+                      color: AppColors.textMain,
+                      fontWeight: FontWeight.w700,
                     ),
                   ),
                 ],
@@ -4265,112 +5645,66 @@ class _DeviceScreenState extends State<DeviceScreen> {
             const SizedBox(height: 12),
             _SensorTile(
               name: 'Rain Sensor',
-              status: hw != null ? 'Online' : 'Syncing',
-              reading: hw != null ? (hw.isRaining ? 'Wet' : 'Dry') : '--',
-              time: hw != null ? 'Live' : 'Pending',
+              status: deviceOnline ? 'Online' : 'Offline',
+              reading: deviceOnline ? (hw!.isRaining ? 'Wet' : 'Dry') : '--',
+              time: deviceOnline ? 'Live' : 'Pending',
               icon: Icons.water_drop_outlined,
             ),
             const SizedBox(height: 10),
             _SensorTile(
               name: 'Temperature Sensor',
-              status: hw != null ? 'Online' : 'Syncing',
-              reading: hw != null ? '${hw.temperatureC.round()}°C' : '--',
-              time: hw != null ? 'Live' : 'Pending',
+              status: deviceOnline ? 'Online' : 'Offline',
+              reading: deviceOnline ? '${hw!.temperatureC.round()}°C' : '--',
+              time: deviceOnline ? 'Live' : 'Pending',
               icon: Icons.thermostat,
             ),
             const SizedBox(height: 10),
             _SensorTile(
               name: 'Humidity Sensor',
-              status: hw != null ? 'Online' : 'Syncing',
-              reading: hw != null ? '${hw.humidity.toStringAsFixed(1)}% RH' : '--',
-              time: hw != null ? 'Live' : 'Pending',
+              status: deviceOnline ? 'Online' : 'Offline',
+              reading: deviceOnline
+                  ? '${hw!.humidity.toStringAsFixed(1)}% RH'
+                  : '--',
+              time: deviceOnline ? 'Live' : 'Pending',
               icon: Icons.eco_outlined,
             ),
             const SizedBox(height: 10),
             _SensorTile(
               name: 'Rack Status',
-              status: hw != null ? 'Online' : 'Syncing',
-              reading: hw != null ? hw.rackStatus : 'Unknown',
-              time: hw != null ? 'Live' : 'Pending',
+              status: deviceOnline ? 'Online' : 'Offline',
+              reading: deviceOnline ? hw!.rackStatus : 'Unknown',
+              time: deviceOnline ? 'Live' : 'Pending',
               icon: Icons.cloud_outlined,
             ),
             const SizedBox(height: 14),
-            Row(
-              children: [
-                Expanded(
-                  child: _InfoStatCard(
-                    title: 'Data Source',
-                    value: hw != null ? 'Hardware' : sourceLabel,
-                    icon: Icons.dataset_linked_outlined,
-                  ),
-                ),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: _InfoStatCard(
-                    title: 'Mode',
-                    value: hw != null ? (hw.isAutoMode ? 'Auto' : 'Manual') : 'Forecast',
-                    icon: Icons.hub_outlined,
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 18),
-            // Motor control panel
-            Container(
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: AppColors.card,
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: AppColors.line),
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
+            IntrinsicHeight(
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  const Text('Motor Control', style: TextStyle(fontWeight: FontWeight.w700)),
-                  const SizedBox(height: 8),
-                  Row(
-                    children: [
-                      Expanded(
-                        child: FilledButton(
-                          onPressed: hw == null
-                              ? null
-                              : () async {
-                                  await _hwService?.sendCommand('DEPLOY');
-                                },
-                          child: const Text('Deploy'),
-                        ),
-                      ),
-                      const SizedBox(width: 10),
-                      Expanded(
-                        child: FilledButton(
-                          style: FilledButton.styleFrom(backgroundColor: AppColors.danger),
-                          onPressed: hw == null
-                              ? null
-                              : () async {
-                                  await _hwService?.sendCommand('RETRACT');
-                                },
-                          child: const Text('Retract', style: TextStyle(color: Colors.white)),
-                        ),
-                      ),
-                    ],
+                  Expanded(
+                    child: _InfoStatCard(
+                      title: 'Data Source',
+                      value: deviceOnline ? 'Hardware' : sourceLabel,
+                      icon: Icons.dataset_linked_outlined,
+                    ),
                   ),
-                  const SizedBox(height: 12),
-                  Row(
-                    children: [
-                      const Text('Auto-Protect'),
-                      const Spacer(),
-                      Switch(
-                        value: hw?.isAutoMode ?? true,
-                        onChanged: hw == null
-                            ? null
-                            : (v) async {
-                                await _hwService?.setAutoMode(v);
-                              },
-                      ),
-                    ],
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: _InfoStatCard(
+                      title: 'Mode',
+                      value: deviceOnline
+                          ? (hw!.isAutoMode ? 'Auto' : 'Manual')
+                          : 'Forecast',
+                      icon: Icons.hub_outlined,
+                    ),
                   ),
                 ],
               ),
+            ),
+            const SizedBox(height: 14),
+            _RackMovementAnalyticsCard(
+              analytics: widget.movementAnalytics,
+              compact: true,
             ),
           ],
         ),
@@ -4379,7 +5713,344 @@ class _DeviceScreenState extends State<DeviceScreen> {
   }
 }
 
-class AlertsScreen extends StatelessWidget {
+class _RackMovementSummaryCard extends StatelessWidget {
+  const _RackMovementSummaryCard({required this.analytics});
+
+  final RackMovementAnalytics? analytics;
+
+  @override
+  Widget build(BuildContext context) {
+    final latest = analytics?.latest;
+    final latestText = latest == null
+        ? 'No rack movement recorded yet.'
+        : '${_rackActionLabel(latest.action)} ${formatActivityTime(latest.startedAt)} via ${_rackTriggerLabel(latest.trigger)}.';
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: const Color(0xFFF3FAFC),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: const Color(0xFFCFE6EE)),
+      ),
+      child: Row(
+        children: [
+          const Icon(Icons.swap_vert_circle_outlined, color: AppColors.primary),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'RACK ACTIVITY',
+                  style: TextStyle(
+                    letterSpacing: 1.5,
+                    color: AppColors.primaryDark,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  latestText,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    color: AppColors.textMain,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 8),
+          Text(
+            analytics == null
+                ? '--'
+                : '${analytics!.extensions + analytics!.retractions}',
+            style: const TextStyle(
+              color: AppColors.primary,
+              fontSize: 22,
+              fontWeight: FontWeight.w800,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _RackMovementAnalyticsCard extends StatelessWidget {
+  const _RackMovementAnalyticsCard({
+    required this.analytics,
+    this.compact = false,
+  });
+
+  final RackMovementAnalytics? analytics;
+  final bool compact;
+
+  @override
+  Widget build(BuildContext context) {
+    final data = analytics;
+    if (data == null) {
+      return const _RackMovementEmptyCard();
+    }
+
+    final latest = data.latest;
+    final duration = data.averageDuration;
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: const Color(0xFFD7E0EC)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(
+                Icons.swap_vert_circle_outlined,
+                color: AppColors.primary,
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  'Rack Movement Analytics',
+                  style: TextStyle(
+                    fontSize: compact ? 18 : 22,
+                    fontWeight: FontWeight.w800,
+                    color: AppColors.textMain,
+                  ),
+                ),
+              ),
+              const Text(
+                '7 DAYS',
+                style: TextStyle(
+                  color: AppColors.textMuted,
+                  fontWeight: FontWeight.w800,
+                  fontSize: 11,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Text(
+            data.interpretation,
+            style: TextStyle(
+              color: AppColors.textMuted,
+              fontWeight: FontWeight.w600,
+              fontSize: compact ? 12.5 : 13,
+              height: 1.35,
+            ),
+          ),
+          const SizedBox(height: 12),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              _RackMetric(
+                label: 'Extended',
+                value: '${data.extensions}',
+                color: AppColors.primary,
+              ),
+              _RackMetric(
+                label: 'Retracted',
+                value: '${data.retractions}',
+                color: AppColors.accentBlue,
+              ),
+              _RackMetric(
+                label: 'Auto',
+                value: '${data.automaticEvents}',
+                color: AppColors.success,
+              ),
+              _RackMetric(
+                label: 'Manual',
+                value: '${data.manualEvents}',
+                color: const Color(0xFFD49B17),
+              ),
+            ],
+          ),
+          if (!compact) ...[
+            const SizedBox(height: 12),
+            Text(
+              duration == null
+                  ? 'Movement duration is not available yet.'
+                  : 'Average movement duration: ${_formatMovementDuration(duration)}',
+              style: const TextStyle(
+                color: AppColors.textMuted,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            const SizedBox(height: 10),
+            if (latest != null) _RackMovementEventTile(event: latest),
+            if (data.events.length > 1) ...[
+              const SizedBox(height: 8),
+              _RackMovementEventTile(event: data.events[1]),
+            ],
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _RackMovementEmptyCard extends StatelessWidget {
+  const _RackMovementEmptyCard();
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: const Color(0xFFF8FAFD),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: const Color(0xFFD7E0EC)),
+      ),
+      child: const Row(
+        children: [
+          Icon(Icons.history_toggle_off, color: AppColors.textMuted),
+          SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              'Rack movement analytics will appear after the app records a movement.',
+              style: TextStyle(
+                color: AppColors.textMuted,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _RackMetric extends StatelessWidget {
+  const _RackMetric({
+    required this.label,
+    required this.value,
+    required this.color,
+  });
+
+  final String label;
+  final String value;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 76,
+      padding: const EdgeInsets.all(9),
+      decoration: BoxDecoration(
+        color: const Color(0xFFF8FAFD),
+        borderRadius: BorderRadius.circular(9),
+        border: Border.all(color: const Color(0xFFE0E7F1)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            label,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              fontSize: 11,
+              color: AppColors.textMuted,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            value,
+            style: TextStyle(
+              fontSize: 20,
+              color: color,
+              fontWeight: FontWeight.w800,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _RackMovementEventTile extends StatelessWidget {
+  const _RackMovementEventTile({required this.event});
+
+  final RackMovementEvent event;
+
+  @override
+  Widget build(BuildContext context) {
+    final isExtend = event.action == 'EXTEND';
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 9),
+      decoration: BoxDecoration(
+        color: const Color(0xFFF8FAFD),
+        borderRadius: BorderRadius.circular(9),
+        border: Border.all(color: const Color(0xFFE0E7F1)),
+      ),
+      child: Row(
+        children: [
+          Icon(
+            isExtend ? Icons.open_in_full : Icons.close_fullscreen,
+            color: isExtend ? AppColors.primary : AppColors.accentBlue,
+            size: 20,
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              '${_rackActionLabel(event.action)} via ${_rackTriggerLabel(event.trigger)}',
+              style: const TextStyle(
+                color: AppColors.textMain,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ),
+          Text(
+            formatActivityTime(event.startedAt),
+            style: const TextStyle(
+              fontSize: 11,
+              color: AppColors.textMuted,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+String _rackActionLabel(String action) {
+  switch (action) {
+    case 'EXTEND':
+      return 'Extended';
+    case 'RETRACT':
+      return 'Retracted';
+    default:
+      return 'Movement';
+  }
+}
+
+String _rackTriggerLabel(String trigger) {
+  switch (trigger) {
+    case 'WEATHER_THRESHOLD':
+      return 'weather protection';
+    case 'RAIN_SENSOR':
+      return 'rain sensor';
+    case 'MANUAL':
+      return 'manual control';
+    default:
+      return 'system';
+  }
+}
+
+String _formatMovementDuration(Duration duration) {
+  if (duration.inSeconds < 60) {
+    return '${duration.inSeconds}s';
+  }
+  return '${duration.inMinutes}m ${duration.inSeconds.remainder(60)}s';
+}
+
+class AlertsScreen extends StatefulWidget {
   const AlertsScreen({
     super.key,
     required this.weather,
@@ -4392,92 +6063,178 @@ class AlertsScreen extends StatelessWidget {
   final DateTime? lastWeatherSyncAt;
 
   @override
+  State<AlertsScreen> createState() => _AlertsScreenState();
+}
+
+class _AlertsScreenState extends State<AlertsScreen> {
+  late Future<List<SavedAlert>> _alertsFuture;
+
+  @override
+  void initState() {
+    super.initState();
+    _alertsFuture = AlertStore.load();
+  }
+
+  Future<void> _markAllRead() async {
+    try {
+      await AlertStore.markAllRead();
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Could not update alerts in the database.'),
+          ),
+        );
+      }
+      return;
+    }
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _alertsFuture = AlertStore.load();
+    });
+  }
+
+  IconData _iconForType(String type) {
+    switch (type) {
+      case 'rain_high':
+        return Icons.warning_amber_rounded;
+      case 'rack_deploy':
+        return Icons.check_circle;
+      case 'sync':
+        return Icons.sync;
+      default:
+        return Icons.cloudy_snowing;
+    }
+  }
+
+  Color _colorForType(String type) {
+    switch (type) {
+      case 'rain_high':
+        return const Color(0xFFF0A63B);
+      case 'rack_deploy':
+        return const Color(0xFF2BB87E);
+      case 'sync':
+        return AppColors.primary;
+      default:
+        return const Color(0xFFE84E47);
+    }
+  }
+
+  String _sectionFor(DateTime timestamp) {
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    final alertDay = DateTime(timestamp.year, timestamp.month, timestamp.day);
+    if (alertDay == today) {
+      return 'TODAY';
+    }
+    if (alertDay == today.subtract(const Duration(days: 1))) {
+      return 'YESTERDAY';
+    }
+    return formatForecastDayDate(timestamp).toUpperCase();
+  }
+
+  @override
   Widget build(BuildContext context) {
     final titleSize = rs(context, 43, min: 30);
-    final now = DateTime.now();
-    final rainProbability = weather?.rainProbability ?? 0;
-    final shouldWarnRain = rainProbability >= 60;
 
     return AppViewport(
       child: SafeArea(
-        child: ListView(
-          padding: const EdgeInsets.fromLTRB(12, 8, 12, 14),
-          children: [
-            Row(
-              children: [
-                const Icon(Icons.arrow_back),
-                const SizedBox(width: 10),
-                Text(
-                  'Alerts',
-                  style: TextStyle(
-                    fontSize: titleSize,
-                    fontWeight: FontWeight.w700,
-                    color: AppColors.textMain,
+        child: FutureBuilder<List<SavedAlert>>(
+          future: _alertsFuture,
+          builder: (context, snapshot) {
+            final alerts = snapshot.data ?? const <SavedAlert>[];
+            final children = <Widget>[
+              Row(
+                children: [
+                  Text(
+                    'Alerts',
+                    style: TextStyle(
+                      fontSize: titleSize,
+                      fontWeight: FontWeight.w700,
+                      color: AppColors.textMain,
+                    ),
                   ),
+                  const Spacer(),
+                  IconButton(
+                    onPressed: alerts.any((alert) => !alert.isRead)
+                        ? _markAllRead
+                        : null,
+                    icon: const Icon(Icons.done_all, color: AppColors.primary),
+                    tooltip: 'Mark all read',
+                  ),
+                ],
+              ),
+              const SizedBox(height: 14),
+            ];
+
+            if (snapshot.connectionState == ConnectionState.waiting) {
+              children.add(const Center(child: CircularProgressIndicator()));
+            } else if (snapshot.hasError) {
+              children.add(
+                Column(
+                  children: [
+                    const Text('Alerts could not be loaded from the database.'),
+                    TextButton(
+                      onPressed: () => setState(() {
+                        _alertsFuture = AlertStore.load();
+                      }),
+                      child: const Text('Retry'),
+                    ),
+                  ],
                 ),
-                const Spacer(),
-                const Icon(Icons.done_all, color: AppColors.primary),
-              ],
-            ),
-            const SizedBox(height: 14),
-            const Text(
-              'TODAY',
-              style: TextStyle(
-                letterSpacing: 2,
-                fontWeight: FontWeight.w700,
-                color: Color(0xFF66758F),
-              ),
-            ),
-            const SizedBox(height: 10),
-            _AlertTile(
-              icon: Icons.cloudy_snowing,
-              iconColor: Color(0xFFE84E47),
-              title: shouldWarnRain
-                  ? 'High rain chance - monitor\nauto retract behavior'
-                  : 'Rain risk normal for\n${location.label}',
-              body:
-                  'Current forecast: $rainProbability% rain\nprobability for your configured location.\nAutomation remains active.',
-              time: formatClockTime(now.subtract(const Duration(minutes: 3))),
-              rightLabel: 'LIVE\nSYNC',
-            ),
-            const SizedBox(height: 10),
-            _AlertTile(
-              icon: Icons.check_circle,
-              iconColor: Color(0xFF2BB87E),
-              title: 'Rack successfully extended',
-                body:
-                  'Manual command completed. Your\nrack is now deployed for drying daing/tuyo.',
-              time: formatClockTime(now.subtract(const Duration(hours: 2))),
-              rightLabel: '2H AGO',
-            ),
-            const SizedBox(height: 12),
-            const Text(
-              'YESTERDAY',
-              style: TextStyle(
-                letterSpacing: 2,
-                fontWeight: FontWeight.w700,
-                color: Color(0xFF66758F),
-              ),
-            ),
-            const SizedBox(height: 10),
-            _AlertTile(
-              icon: Icons.warning_amber_rounded,
-              iconColor: Color(0xFFF0A63B),
-              title: 'High rain probability detected\n($rainProbability%)',
-              body:
-                  'Forecast is evaluated using your saved\ncoordinates for ${location.label}. Consider\nmanual review when threshold is exceeded.',
-              time: formatClockTime(now.subtract(const Duration(hours: 18))),
-            ),
-            const SizedBox(height: 10),
-            _AlertTile(
-              icon: Icons.sync,
-              iconColor: AppColors.primary,
-              title: 'Weather and safety checks updated',
-              body:
-                  '${formatRelativeTime(lastWeatherSyncAt)}\nLocation-aware forecast logic is running\nfor automation decisions.',
-              time: formatClockTime(now.subtract(const Duration(hours: 22))),
-            ),
-          ],
+              );
+            } else if (alerts.isEmpty) {
+              children.add(
+                const _SimpleInfoTile(
+                  title: 'No saved alerts yet',
+                  trailing: 'Ready',
+                ),
+              );
+            } else {
+              String? activeSection;
+              for (final alert in alerts) {
+                final section = _sectionFor(alert.timestamp);
+                if (section != activeSection) {
+                  if (activeSection != null) {
+                    children.add(const SizedBox(height: 12));
+                  }
+                  children.add(
+                    Text(
+                      section,
+                      style: const TextStyle(
+                        letterSpacing: 2,
+                        fontWeight: FontWeight.w700,
+                        color: Color(0xFF66758F),
+                      ),
+                    ),
+                  );
+                  children.add(const SizedBox(height: 10));
+                  activeSection = section;
+                }
+                children.add(
+                  _AlertTile(
+                    icon: _iconForType(alert.type),
+                    iconColor: _colorForType(alert.type),
+                    title: alert.title,
+                    body: alert.body,
+                    time: formatClockTime(alert.timestamp),
+                    isRead: alert.isRead,
+                    rightLabel:
+                        alert.rightLabel ??
+                        formatAlertRelativeTime(alert.timestamp),
+                  ),
+                );
+                children.add(const SizedBox(height: 10));
+              }
+            }
+
+            return ListView(
+              padding: const EdgeInsets.fromLTRB(12, 8, 12, 14),
+              children: children,
+            );
+          },
         ),
       ),
     );
@@ -4503,8 +6260,68 @@ class SettingsScreen extends StatefulWidget {
 }
 
 class _SettingsScreenState extends State<SettingsScreen> {
-  bool darkMode = false;
-  bool pushNotifications = true;
+  bool pushNotifications = false;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_loadNotificationPreference());
+  }
+
+  Future<void> _loadNotificationPreference() async {
+    var enabled = await NotificationPreferences.loadEnabled();
+    if (enabled) {
+      enabled = await PushNotificationService.requestPermission();
+      await NotificationPreferences.saveEnabled(enabled);
+    }
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      pushNotifications = enabled;
+    });
+  }
+
+  Future<void> _onPushNotificationChanged(bool value) async {
+    if (!value) {
+      await NotificationPreferences.saveEnabled(false);
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        pushNotifications = false;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('App notifications disabled.')),
+      );
+      return;
+    }
+
+    final allowed = await PushNotificationService.requestPermission();
+    await NotificationPreferences.saveEnabled(allowed);
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      pushNotifications = allowed;
+    });
+    if (allowed) {
+      await PushNotificationService.show(
+        title: 'SILONG notifications enabled',
+        body: 'This is a test notification from your device.',
+      );
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('App notification enabled.')),
+      );
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Notification permission was denied.')),
+      );
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -4519,7 +6336,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
               padding: const EdgeInsets.fromLTRB(12, 8, 12, 10),
               child: Row(
                 children: [
-                  const Icon(Icons.arrow_back),
                   const Spacer(),
                   Text(
                     'Settings',
@@ -4552,7 +6368,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
             const SizedBox(height: 10),
             Center(
               child: Text(
-                'Sun-Dry',
+                'SILONG',
                 style: TextStyle(
                   fontSize: brandSize,
                   fontWeight: FontWeight.w700,
@@ -4568,28 +6384,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
             ),
             const SizedBox(height: 14),
             const _SectionLabel(label: 'PREFERENCES'),
-            _SwitchTile(
-              icon: Icons.dark_mode_outlined,
-              title: 'Dark Mode',
-              subtitle: 'Switch between light and dark\nthemes',
-              value: darkMode,
-              onChanged: (value) => setState(() => darkMode = value),
-            ),
-            const SizedBox(height: 8),
             const _SectionLabel(label: 'Notifications'),
             _SwitchTile(
               icon: Icons.notifications_none,
               title: 'Push Notifications',
               value: pushNotifications,
-              onChanged: (value) => setState(() => pushNotifications = value),
+              onChanged: (value) =>
+                  unawaited(_onPushNotificationChanged(value)),
             ),
             const SizedBox(height: 8),
-            const _SectionLabel(label: 'DEVICE CALIBRATION'),
-            const _ChevronTile(
-              title: 'Sensor Calibration',
-              subtitle: 'Adjust humidity and temp offsets',
-              icon: Icons.tune,
-            ),
             GestureDetector(
               onTap: () => widget.onChangeLocation(),
               child: _ChevronTile(
@@ -4602,20 +6405,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
               onTap: widget.onOpenThreshold,
               child: const _ChevronTile(
                 title: 'Threshold Configuration',
-                subtitle: 'Set alert limits for all devices',
+                subtitle: 'Set rain risk for automatic rack response',
                 icon: Icons.tune_outlined,
               ),
             ),
             const SizedBox(height: 8),
-            const _SectionLabel(label: 'APPLICATION INFO'),
-            const _SimpleInfoTile(
-              title: 'App Version',
-              trailing: 'v2.4.1 (Stable)',
-            ),
-            const _SimpleInfoTile(
-              title: 'About Sun-Dry',
-              trailingIcon: Icons.info_outline,
-            ),
             GestureDetector(
               onTap: () => widget.onSignOut(),
               child: const _SimpleInfoTile(
@@ -4633,7 +6427,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
 }
 
 class ThresholdConfigurationScreen extends StatefulWidget {
-  const ThresholdConfigurationScreen({super.key});
+  const ThresholdConfigurationScreen({
+    super.key,
+    required this.weather,
+    required this.initialThreshold,
+    required this.onSaved,
+  });
+
+  final WeatherSnapshot? weather;
+  final int initialThreshold;
+  final Future<void> Function(int threshold) onSaved;
 
   @override
   State<ThresholdConfigurationScreen> createState() =>
@@ -4642,7 +6445,14 @@ class ThresholdConfigurationScreen extends StatefulWidget {
 
 class _ThresholdConfigurationScreenState
     extends State<ThresholdConfigurationScreen> {
-  double value = 75;
+  late double value;
+  bool _isSaving = false;
+
+  @override
+  void initState() {
+    super.initState();
+    value = widget.initialThreshold.toDouble();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -4660,12 +6470,6 @@ class _ThresholdConfigurationScreenState
             color: AppColors.textMain,
           ),
         ),
-        actions: const [
-          Padding(
-            padding: EdgeInsets.only(right: 12),
-            child: Icon(Icons.info_outline, color: AppColors.primary),
-          ),
-        ],
       ),
       body: AppViewport(
         child: SafeArea(
@@ -4678,7 +6482,7 @@ class _ThresholdConfigurationScreenState
                   const SizedBox(width: 8),
                   Expanded(
                     child: Text(
-                      'Sun-Dry Settings',
+                      'SILONG Settings',
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: TextStyle(
@@ -4692,7 +6496,7 @@ class _ThresholdConfigurationScreenState
               ),
               const SizedBox(height: 10),
               const Text(
-                'Set the rain probability at which the daing/tuyo\ndrying rack should automatically retract to protect\nyour drying batch.',
+                'Set the rain probability at which the daing/tuyo\ndrying rack should automatically extend its protection mode.',
                 style: TextStyle(fontSize: 18, color: Color(0xFF60728F)),
               ),
               const SizedBox(height: 18),
@@ -4784,15 +6588,18 @@ class _ThresholdConfigurationScreenState
                   borderRadius: BorderRadius.circular(10),
                   border: Border.all(color: const Color(0xFFBFEDE2)),
                 ),
-                child: const Row(
+                child: Row(
                   children: [
-                    Icon(Icons.analytics_outlined, color: AppColors.primary),
-                    SizedBox(width: 12),
+                    const Icon(
+                      Icons.analytics_outlined,
+                      color: AppColors.primary,
+                    ),
+                    const SizedBox(width: 12),
                     Expanded(
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Text(
+                          const Text(
                             'Current Local Forecast',
                             style: TextStyle(
                               fontWeight: FontWeight.w700,
@@ -4800,8 +6607,10 @@ class _ThresholdConfigurationScreenState
                             ),
                           ),
                           Text(
-                            'Rain probability for the next 2 hours is\n12%.',
-                            style: TextStyle(color: Color(0xFF4F5F76)),
+                            widget.weather == null
+                                ? 'Rain probability is still syncing.'
+                                : 'Rain probability is ${widget.weather!.rainProbability}%.',
+                            style: const TextStyle(color: Color(0xFF4F5F76)),
                           ),
                         ],
                       ),
@@ -4818,13 +6627,30 @@ class _ThresholdConfigurationScreenState
                   ),
                   backgroundColor: AppColors.primary,
                 ),
-                onPressed: () {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    SnackBar(
-                      content: Text('Threshold saved at ${value.round()}%'),
-                    ),
-                  );
-                },
+                onPressed: _isSaving
+                    ? null
+                    : () async {
+                        final threshold = value.round();
+                        final messenger = ScaffoldMessenger.of(context);
+                        setState(() {
+                          _isSaving = true;
+                        });
+                        try {
+                          await ThresholdStore.saveRainProbability(threshold);
+                          await widget.onSaved(threshold);
+                          messenger.showSnackBar(
+                            SnackBar(
+                              content: Text('Threshold saved at $threshold%'),
+                            ),
+                          );
+                        } finally {
+                          if (mounted) {
+                            setState(() {
+                              _isSaving = false;
+                            });
+                          }
+                        }
+                      },
                 child: const Row(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
@@ -4860,9 +6686,14 @@ class _ManualOverrideScreenState extends State<ManualOverrideScreen> {
   HardwareService? _hwService;
   bool _busy = false;
   String? _statusMessage;
+  String _rackStatusLabel = 'Unknown';
+  DateTime? _lastManualStatusUpdateAt;
 
   String _currentOwnerEmail() {
-    return Supabase.instance.client.auth.currentUser?.email?.trim().toLowerCase() ?? '';
+    return Supabase.instance.client.auth.currentUser?.email
+            ?.trim()
+            .toLowerCase() ??
+        '';
   }
 
   @override
@@ -4876,6 +6707,22 @@ class _ManualOverrideScreenState extends State<ManualOverrideScreen> {
           deviceId: 'ESP32_RACK_01',
           ownerEmail: ownerEmail,
         );
+        _hwService!.subscribe((state) {
+          if (!mounted) {
+            return;
+          }
+          final manualUpdateAt = _lastManualStatusUpdateAt;
+          if (manualUpdateAt != null &&
+              DateTime.now().difference(manualUpdateAt) <
+                  const Duration(seconds: 8)) {
+            return;
+          }
+          setState(() {
+            _rackStatusLabel = state.isOnline
+                ? _rackStatusFromHardware(state.rackStatus)
+                : 'Offline';
+          });
+        });
       }
     }
   }
@@ -4886,25 +6733,72 @@ class _ManualOverrideScreenState extends State<ManualOverrideScreen> {
     super.dispose();
   }
 
+  String _rackStatusFromHardware(String status) {
+    final normalized = status.trim().toUpperCase();
+    if (normalized.isEmpty || normalized == 'UNKNOWN') {
+      return 'Unknown';
+    }
+    if (isRackSafetyStatus(normalized)) {
+      return normalized;
+    }
+    if (normalized.contains('OPEN') ||
+        normalized.contains('EXTEND') ||
+        normalized.contains('DEPLOY')) {
+      return 'Extended';
+    }
+    if (normalized.contains('MOVING')) {
+      return 'Moving';
+    }
+    return 'Retracted';
+  }
+
+  String _rackStatusFromCommand(String command) {
+    return command == 'DEPLOY' ? 'Extending...' : 'Retracting...';
+  }
+
   Future<void> _sendCommand(String command) async {
     if (_hwService == null || _busy) {
       return;
     }
+    final previousRackStatus = _rackStatusLabel;
     setState(() {
       _busy = true;
       _statusMessage = null;
+      _rackStatusLabel = command == 'DEPLOY' ? 'Extending...' : 'Retracting...';
     });
     try {
       await _hwService!.sendCommand(command);
+      HardwareService.noteAppCommandIssued(command);
+      await RackMovementStore.record(
+        action: command == 'DEPLOY' ? 'EXTEND' : 'RETRACT',
+        trigger: 'MANUAL',
+        mode: 'MANUAL',
+        status: 'REQUESTED',
+      );
       if (!mounted) return;
       setState(() {
         _busy = false;
-        _statusMessage = '$command sent';
+        _lastManualStatusUpdateAt = DateTime.now();
+        _rackStatusLabel = _rackStatusFromCommand(command);
+        _statusMessage = '$command sent. Waiting for hardware...';
       });
+      final isDeploy = command == 'DEPLOY';
+      final alert = SavedAlert(
+        id: 'manual-$command-${DateTime.now().millisecondsSinceEpoch}',
+        type: isDeploy ? 'rack_deploy' : 'sync',
+        title: isDeploy ? 'Rack extend requested' : 'Rack retract requested',
+        body: isDeploy
+            ? 'Manual DEPLOY was sent. The rack is waiting to confirm extension.'
+            : 'Manual RETRACT was sent. The rack is waiting to confirm retraction.',
+        timestamp: DateTime.now(),
+        rightLabel: 'REQUEST',
+      );
+      await AlertStore.saveAlert(alert);
     } catch (_) {
       if (!mounted) return;
       setState(() {
         _busy = false;
+        _rackStatusLabel = previousRackStatus;
         _statusMessage = 'Failed to send $command';
       });
     }
@@ -4912,8 +6806,6 @@ class _ManualOverrideScreenState extends State<ManualOverrideScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final emergencyText = rs(context, 30, min: 22);
-
     return Scaffold(
       appBar: AppBar(
         leading: const BackButton(),
@@ -4924,17 +6816,29 @@ class _ManualOverrideScreenState extends State<ManualOverrideScreen> {
             color: AppColors.textMain,
           ),
         ),
-        actions: const [
-          Padding(
-            padding: EdgeInsets.only(right: 12),
-            child: Icon(Icons.info_outline),
-          ),
-        ],
       ),
       body: AppViewport(
         child: ListView(
           padding: const EdgeInsets.all(12),
           children: [
+            if (isRackSafetyStatus(_rackStatusLabel))
+              Container(
+                padding: const EdgeInsets.all(14),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFFFF3E0),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: const Color(0xFFE7B66A)),
+                ),
+                child: Text(
+                  rackSafetyBody(_rackStatusLabel),
+                  style: const TextStyle(
+                    color: Color(0xFF7A4B00),
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+            if (isRackSafetyStatus(_rackStatusLabel))
+              const SizedBox(height: 12),
             if (_statusMessage != null) ...[
               Container(
                 padding: const EdgeInsets.all(12),
@@ -4954,47 +6858,6 @@ class _ManualOverrideScreenState extends State<ManualOverrideScreen> {
               const SizedBox(height: 12),
             ],
             Container(
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: Colors.white,
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: const Color(0xFFE3E8F1)),
-              ),
-              child: const Row(
-                children: [
-                  Icon(Icons.error, color: Color(0xFFFF6B57), size: 18),
-                  SizedBox(width: 8),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          'SYSTEM MOVING...',
-                          style: TextStyle(
-                            color: Color(0xFFFF6B57),
-                            fontWeight: FontWeight.w700,
-                            letterSpacing: 1,
-                          ),
-                        ),
-                        Text(
-                          'Rack is currently transitioning to extended\nposition.',
-                          style: TextStyle(color: Color(0xFFFF6B57)),
-                        ),
-                      ],
-                    ),
-                  ),
-                  Text(
-                    '45%',
-                    style: TextStyle(
-                      color: Color(0xFF70809A),
-                      fontWeight: FontWeight.w700,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-            const SizedBox(height: 12),
-            Container(
               height: 200,
               decoration: BoxDecoration(
                 color: Colors.white,
@@ -5009,10 +6872,11 @@ class _ManualOverrideScreenState extends State<ManualOverrideScreen> {
                     shape: BoxShape.circle,
                     border: Border.all(color: AppColors.primary, width: 7),
                   ),
-                  child: const Center(
+                  child: Center(
                     child: Text(
-                      'Retracted',
-                      style: TextStyle(
+                      _rackStatusLabel,
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(
                         fontSize: 24,
                         fontWeight: FontWeight.w700,
                         color: AppColors.textMain,
@@ -5034,7 +6898,9 @@ class _ManualOverrideScreenState extends State<ManualOverrideScreen> {
                         borderRadius: BorderRadius.circular(10),
                       ),
                     ),
-                    onPressed: _hwService == null || _busy ? null : () => _sendCommand('DEPLOY'),
+                    onPressed: _hwService == null || _busy
+                        ? null
+                        : () => _sendCommand('DEPLOY'),
                     child: const Text(
                       'Extend Rack',
                       style: TextStyle(
@@ -5055,7 +6921,9 @@ class _ManualOverrideScreenState extends State<ManualOverrideScreen> {
                         borderRadius: BorderRadius.circular(10),
                       ),
                     ),
-                    onPressed: _hwService == null || _busy ? null : () => _sendCommand('RETRACT'),
+                    onPressed: _hwService == null || _busy
+                        ? null
+                        : () => _sendCommand('RETRACT'),
                     child: const Text(
                       'Retract Rack',
                       style: TextStyle(
@@ -5090,8 +6958,6 @@ class _ManualOverrideScreenState extends State<ManualOverrideScreen> {
                   SizedBox(height: 10),
                   _SafetyRow(text: 'Clear area of obstacles'),
                   SizedBox(height: 8),
-                  _SafetyRow(text: 'Verify weight limit (< 25kg)'),
-                  SizedBox(height: 8),
                   _SafetyRow(text: 'Stable power connection'),
                 ],
               ),
@@ -5105,256 +6971,15 @@ class _ManualOverrideScreenState extends State<ManualOverrideScreen> {
                   borderRadius: BorderRadius.circular(12),
                 ),
               ),
-              onPressed: _hwService == null || _busy ? null : () => _sendCommand('RETRACT'),
+              onPressed: _hwService == null || _busy
+                  ? null
+                  : () => _sendCommand('RETRACT'),
               child: Text(
-                'EMERGENCY STOP',
+                'RETRACT RACK',
                 style: TextStyle(
-                  fontSize: emergencyText,
+                  fontSize: rs(context, 24, min: 18),
                   color: Colors.white,
                   fontWeight: FontWeight.w800,
-                ),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class ManualOverrideLiveScreen extends StatefulWidget {
-  const ManualOverrideLiveScreen({super.key});
-
-  @override
-  State<ManualOverrideLiveScreen> createState() => _ManualOverrideLiveScreenState();
-}
-
-class _ManualOverrideLiveScreenState extends State<ManualOverrideLiveScreen> {
-  HardwareService? _hwService;
-  bool _busy = false;
-  String? _statusMessage;
-
-  String _currentOwnerEmail() {
-    return Supabase.instance.client.auth.currentUser?.email?.trim().toLowerCase() ?? '';
-  }
-
-  @override
-  void initState() {
-    super.initState();
-    if (_supabaseInitialized) {
-      final ownerEmail = _currentOwnerEmail();
-      if (ownerEmail.isNotEmpty) {
-        _hwService = HardwareService(
-          Supabase.instance.client,
-          deviceId: 'ESP32_RACK_01',
-          ownerEmail: ownerEmail,
-        );
-      }
-    }
-  }
-
-  @override
-  void dispose() {
-    _hwService?.dispose();
-    super.dispose();
-  }
-
-  Future<void> _sendCommand(String command) async {
-    if (_hwService == null || _busy) {
-      return;
-    }
-    setState(() {
-      _busy = true;
-      _statusMessage = null;
-    });
-    try {
-      await _hwService!.sendCommand(command);
-      if (!mounted) return;
-      setState(() {
-        _busy = false;
-        _statusMessage = '$command sent';
-      });
-    } catch (_) {
-      if (!mounted) return;
-      setState(() {
-        _busy = false;
-        _statusMessage = 'Failed to send $command';
-      });
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final rackValue = rs(context, 42, min: 30);
-    final emergencyText = rs(context, 32, min: 22);
-
-    return Scaffold(
-      appBar: AppBar(
-        leading: const BackButton(),
-        title: const Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              'Manual Override',
-              style: TextStyle(
-                fontWeight: FontWeight.w700,
-                color: AppColors.textMain,
-              ),
-            ),
-            Text(
-              'SUN-DRY SYSTEM',
-              style: TextStyle(
-                fontSize: 11,
-                color: AppColors.primary,
-                letterSpacing: 1.2,
-              ),
-            ),
-          ],
-        ),
-        actions: const [
-          Padding(
-            padding: EdgeInsets.only(right: 12),
-            child: Chip(label: Text('Live Console')),
-          ),
-        ],
-      ),
-      body: AppViewport(
-        child: ListView(
-          padding: const EdgeInsets.all(12),
-          children: [
-            if (_statusMessage != null) ...[
-              Container(
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                  color: const Color(0xFFEAF6FA),
-                  borderRadius: BorderRadius.circular(12),
-                  border: Border.all(color: const Color(0xFFD1E7F0)),
-                ),
-                child: Text(
-                  _statusMessage!,
-                  style: const TextStyle(
-                    color: Color(0xFF5D758E),
-                    fontWeight: FontWeight.w700,
-                  ),
-                ),
-              ),
-              const SizedBox(height: 12),
-            ],
-            Container(
-              padding: const EdgeInsets.all(14),
-              decoration: BoxDecoration(
-                color: Colors.white,
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: const Color(0xFFDDE6F1)),
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text(
-                    'RACK POSITION STATUS',
-                    style: TextStyle(
-                      letterSpacing: 2,
-                      color: Color(0xFF687991),
-                      fontWeight: FontWeight.w700,
-                    ),
-                  ),
-                  SizedBox(height: 6),
-                  Text(
-                    '50% Extended',
-                    style: TextStyle(
-                      fontSize: rackValue,
-                      fontWeight: FontWeight.w700,
-                      color: AppColors.textMain,
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-                  const ClipRRect(
-                    borderRadius: BorderRadius.all(Radius.circular(10)),
-                    child: LinearProgressIndicator(
-                      value: 0.5,
-                      minHeight: 12,
-                      color: AppColors.primary,
-                      backgroundColor: Color(0xFFE6ECF5),
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-                  const Text(
-                    'RETRACTED PARTIAL (OPTIMAL) FULLY EXTENDED',
-                    style: TextStyle(
-                      fontSize: 12,
-                      color: Color(0xFF7C8AA3),
-                      fontWeight: FontWeight.w700,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-            const SizedBox(height: 14),
-            Container(
-              padding: const EdgeInsets.all(14),
-              decoration: BoxDecoration(
-                color: const Color(0xFFE9F8F5),
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: const Color(0xFFBAE9DE)),
-              ),
-              child: const Text(
-                'SAFETY PROTOCOL ACTIVE: HOLD BUTTON FOR 2 SECONDS TO INITIATE MOVEMENT. ANY MOVEMENT WILL TRIGGER THE EXTERNAL STROBE LIGHT.',
-                style: TextStyle(
-                  fontSize: 12,
-                  letterSpacing: 1.2,
-                  color: Color(0xFF638099),
-                  fontWeight: FontWeight.w700,
-                ),
-              ),
-            ),
-            const SizedBox(height: 16),
-            Row(
-              children: [
-                Expanded(
-                  child: _ConsoleActionButton(
-                    title: 'EXTEND RACK',
-                    icon: Icons.unfold_more,
-                    onTap: _hwService == null || _busy ? null : () => _sendCommand('DEPLOY'),
-                  ),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: _ConsoleActionButton(
-                    title: 'RETRACT RACK',
-                    icon: Icons.unfold_less,
-                    darkIcon: true,
-                    onTap: _hwService == null || _busy ? null : () => _sendCommand('RETRACT'),
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 18),
-            FilledButton(
-              style: FilledButton.styleFrom(
-                backgroundColor: AppColors.danger,
-                minimumSize: const Size.fromHeight(58),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(12),
-                ),
-              ),
-              onPressed: _hwService == null || _busy ? null : () => _sendCommand('RETRACT'),
-              child: Text(
-                'EMERGENCY STOP',
-                style: TextStyle(
-                  fontSize: emergencyText,
-                  color: Colors.white,
-                  fontWeight: FontWeight.w800,
-                ),
-              ),
-            ),
-            const SizedBox(height: 12),
-            const Center(
-              child: Text(
-                'DISENGAGES ALL HYDRAULIC POWER IMMEDIATELY',
-                style: TextStyle(
-                  letterSpacing: 2,
-                  color: Color(0xFF9CA8BC),
-                  fontWeight: FontWeight.w700,
                 ),
               ),
             ),
@@ -5369,22 +6994,15 @@ class ActivityHistoryScreen extends StatelessWidget {
   const ActivityHistoryScreen({
     super.key,
     required this.location,
-    required this.weather,
-    required this.lastWeatherSyncAt,
+    required this.movementAnalytics,
   });
 
   final AppLocation location;
-  final WeatherSnapshot? weather;
-  final DateTime? lastWeatherSyncAt;
+  final RackMovementAnalytics? movementAnalytics;
 
   @override
   Widget build(BuildContext context) {
-    final now = DateTime.now();
-    final activities = buildRecentActivityFeed(
-      location: location,
-      weather: weather,
-      lastWeatherSyncAt: lastWeatherSyncAt,
-    );
+    final activities = buildRecentActivityFeed(movementAnalytics);
 
     return Scaffold(
       appBar: AppBar(
@@ -5393,7 +7011,7 @@ class ActivityHistoryScreen extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             const Text(
-              'Sun-Dry',
+              'SILONG',
               style: TextStyle(
                 fontWeight: FontWeight.w700,
                 color: AppColors.textMain,
@@ -5405,56 +7023,14 @@ class ActivityHistoryScreen extends StatelessWidget {
             ),
           ],
         ),
-        actions: const [
-          Padding(
-            padding: EdgeInsets.only(right: 12),
-            child: Icon(Icons.info_outline, color: AppColors.primary),
-          ),
-        ],
       ),
       body: AppViewport(
         child: ListView(
           padding: const EdgeInsets.fromLTRB(12, 6, 12, 14),
           children: [
-            TextField(
-              decoration: InputDecoration(
-                hintText: 'Search logs or events...',
-                hintStyle: const TextStyle(color: Color(0xFF9AA9C0)),
-                prefixIcon: const Icon(Icons.search, color: Color(0xFF8FA0BA)),
-                filled: true,
-                fillColor: Colors.white,
-                contentPadding: const EdgeInsets.symmetric(
-                  horizontal: 14,
-                  vertical: 10,
-                ),
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(10),
-                  borderSide: const BorderSide(color: Color(0xFFD8E1EC)),
-                ),
-                enabledBorder: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(10),
-                  borderSide: const BorderSide(color: Color(0xFFD8E1EC)),
-                ),
-              ),
-            ),
-            const SizedBox(height: 10),
-            const SingleChildScrollView(
-              scrollDirection: Axis.horizontal,
-              child: Row(
-                children: [
-                  _FilterChipActive(label: 'All\nLogs'),
-                  SizedBox(width: 8),
-                  _FilterChipMute(label: 'Sensors'),
-                  SizedBox(width: 8),
-                  _FilterChipMute(label: 'System'),
-                  SizedBox(width: 8),
-                  _FilterChipMute(label: 'Manual'),
-                ],
-              ),
-            ),
             const SizedBox(height: 12),
             Text(
-              'TODAY - ${formatDayDate(now)}',
+              'RACK MOVEMENTS · LAST 7 DAYS',
               style: TextStyle(
                 color: Color(0xFF7588A4),
                 letterSpacing: 2,
@@ -5462,15 +7038,21 @@ class ActivityHistoryScreen extends StatelessWidget {
               ),
             ),
             const SizedBox(height: 8),
-            for (var i = 0; i < activities.length; i++)
-              _TimelineItem(
-                title: activities[i].title,
-                subtitle: activities[i].subtitle,
-                time: formatActivityTime(activities[i].timestamp),
-                response: activities[i].response,
-                icon: activities[i].icon,
-                isLast: i == activities.length - 1,
-              ),
+            if (activities.isEmpty)
+              const _SimpleInfoTile(
+                title: 'No rack movement history yet',
+                trailing: 'No events',
+              )
+            else
+              for (var i = 0; i < activities.length; i++)
+                _TimelineItem(
+                  title: activities[i].title,
+                  subtitle: activities[i].subtitle,
+                  time: formatActivityTime(activities[i].timestamp),
+                  response: activities[i].response,
+                  icon: activities[i].icon,
+                  isLast: i == activities.length - 1,
+                ),
           ],
         ),
       ),
@@ -5594,21 +7176,187 @@ class _PredictiveAnalyticsCard extends StatelessWidget {
   final WeatherSnapshot? weather;
   final AppLocation location;
 
+  List<_WeatherTrendPoint> _trendPoints() {
+    final upcoming =
+        weather?.forecast
+            .where(
+              (point) => point.timestamp.isAfter(
+                DateTime.now().subtract(const Duration(minutes: 1)),
+              ),
+            )
+            .toList() ??
+        <ForecastPoint>[];
+    upcoming.sort((a, b) => a.timestamp.compareTo(b.timestamp));
+
+    if (upcoming.isEmpty) {
+      return const <_WeatherTrendPoint>[];
+    }
+
+    final windows = <_WeatherTrendPoint>[];
+    var cursor = upcoming.first.timestamp;
+    var index = 0;
+
+    while (index < upcoming.length && windows.length < 8) {
+      final end = cursor.add(const Duration(hours: 2));
+      final bucket = <ForecastPoint>[];
+      while (index < upcoming.length &&
+          !upcoming[index].timestamp.isBefore(cursor) &&
+          upcoming[index].timestamp.isBefore(end)) {
+        bucket.add(upcoming[index]);
+        index++;
+      }
+
+      if (bucket.isEmpty) {
+        final point = upcoming[index];
+        cursor = point.timestamp;
+        bucket.add(point);
+        index++;
+      }
+
+      final avgRain =
+          (bucket.fold<int>(0, (sum, point) => sum + point.rainProbability) /
+                  bucket.length)
+              .round()
+              .clamp(0, 100);
+      final temps = bucket
+          .map((point) => point.temperatureC ?? weather?.temperatureC)
+          .whereType<double>()
+          .toList();
+      final avgTemp = temps.isEmpty
+          ? weather?.temperatureC
+          : temps.reduce((sum, value) => sum + value) / temps.length;
+      final cloudValues = bucket
+          .map((point) => point.cloudCover)
+          .whereType<int>()
+          .toList();
+      final avgCloudCover = cloudValues.isEmpty
+          ? null
+          : (cloudValues.fold<int>(0, (sum, value) => sum + value) /
+                    cloudValues.length)
+                .round()
+                .clamp(0, 100);
+
+      windows.add(
+        _WeatherTrendPoint(
+          time: cursor,
+          endTime: cursor.add(const Duration(hours: 2)),
+          rainProbability: avgRain,
+          temperatureC: avgTemp,
+          cloudCover: avgCloudCover,
+        ),
+      );
+      cursor = end;
+    }
+
+    return windows;
+  }
+
+  IconData _weatherIconForPoint(_WeatherTrendPoint point) {
+    if (point.rainProbability >= 70) {
+      return Icons.thunderstorm_outlined;
+    }
+    if ((point.cloudCover ?? 100) <= 25 && point.rainProbability <= 35) {
+      return Icons.wb_sunny_outlined;
+    }
+    if ((point.cloudCover ?? 100) <= 55) {
+      return Icons.wb_cloudy_outlined;
+    }
+    if (point.rainProbability >= 45) {
+      return Icons.water_drop_outlined;
+    }
+    return Icons.cloud_outlined;
+  }
+
+  Color _riskColor(int probability) {
+    if (probability >= 60) {
+      return AppColors.danger;
+    }
+    if (probability >= 40) {
+      return const Color(0xFFD49B17);
+    }
+    return AppColors.success;
+  }
+
+  Color _sunlightColor(int probability) {
+    if (probability >= 60) {
+      return AppColors.success;
+    }
+    if (probability >= 40) {
+      return const Color(0xFFD49B17);
+    }
+    return AppColors.danger;
+  }
+
+  bool _isWithinBestWindow(DateTime time, DateTime? start, DateTime? end) {
+    if (start == null || end == null) {
+      return false;
+    }
+    return !time.isBefore(start) && time.isBefore(end);
+  }
+
   @override
   Widget build(BuildContext context) {
     final predictive = weather?.predictive;
-    final bool hasAnalytics = predictive != null;
-    final bool usesOpenWeather =
-      (weather?.source ?? '').contains('OpenWeather');
+    final bool usesOpenWeather = (weather?.source ?? '').contains(
+      'OpenWeather',
+    );
     final bool openWeatherConfigured =
-      OpenWeatherService.hasAnyOpenWeatherProvider;
-    final headerSize = rs(context, 22, min: 16);
-    final bodySize = rs(context, 16, min: 12);
+        OpenWeatherService.hasAnyOpenWeatherProvider;
+    final titleSize = rs(context, 22, min: 17);
+    final bodySize = rs(context, 14, min: 12);
     final target = location.city ?? location.province ?? location.label;
+    final trendPoints = _trendPoints();
+    final optimalSunlightWindow = _buildOptimalSunlightWindow(
+      weather?.forecast ?? const <ForecastPoint>[],
+    );
+    final currentRain =
+        weather?.rainProbability ?? predictive?.nextRainProbability ?? 0;
+    final peakRain = predictive?.maxRainProbability ?? currentRain;
+    final rainColor = _riskColor(peakRain);
+    final peakSunlight = optimalSunlightWindow?.peakSunlight.round() ?? 0;
+    final sunlightColor = _sunlightColor(peakSunlight);
+    final bestWindowLabel =
+        predictive?.bestDryingWindowLabel ??
+        'No best drying weather at this time period';
+    final dryingScoreLabel = predictive == null
+        ? '--'
+        : '${predictive.dryingScore}/100';
+    final nextActionLabel =
+        predictive?.nextBestAction ?? 'Monitor forecast updates';
+    final rainRiskLabel =
+        predictive?.nextRainRiskLabel ?? 'No major rain spike in range';
+    final recommendationText =
+        predictive?.recommendation ??
+        'Forecast is still syncing for drying guidance.';
+    final bestWindowStart = predictive?.bestDryingStartTime;
+    final bestWindowEnd = predictive?.bestDryingEndTime;
+    final safeHoursLabel = predictive == null
+        ? 'No best drying weather at this time period'
+        : formatDryingWindowCountdown(
+            start: bestWindowStart,
+            end: bestWindowEnd,
+            hasBestWindow: predictive.hasClearBestDryingWindow,
+          );
+    final safeHoursDetail = predictive == null
+        ? 'No best drying weather at this time period'
+        : (predictive.hasClearBestDryingWindow &&
+                  bestWindowStart != null &&
+                  bestWindowEnd != null
+              ? formatForecastWindow(bestWindowStart, bestWindowEnd)
+              : 'No best drying weather at this time period');
+    final optimalSunlightDayLabel =
+        optimalSunlightWindow?.dayLabel ?? 'No sunny day found';
+    final optimalSunlightTimeLabel =
+        optimalSunlightWindow?.timeLabel ?? 'No sunny day found';
+    final optimalSunlightDetail = optimalSunlightWindow == null
+        ? 'Forecast is still syncing for drying guidance.'
+        : 'Highest sunlight chance this week';
 
     String statusLine;
-    if (hasAnalytics) {
-      statusLine = 'OpenWeather ${predictive!.windowHours}h outlook for $target.';
+    if (predictive != null) {
+      statusLine =
+          '${weather?.source ?? 'Weather'} '
+          'forecast for $target.';
     } else if (weather == null) {
       statusLine = openWeatherConfigured
           ? 'Forecast data is syncing for predictive analytics.'
@@ -5621,75 +7369,362 @@ class _PredictiveAnalyticsCard extends StatelessWidget {
       statusLine = 'OpenWeather cloud function not configured.';
     }
 
-    final peakTimeLabel = predictive?.peakTime == null
-        ? 'soon'
-        : formatClockTime(predictive!.peakTime!);
-    final dryingWindowLabel = predictive == null
-        ? ''
-        : (predictive!.dryingWindowHours <= 0
-              ? 'Immediate cover recommended'
-              : '~${predictive!.dryingWindowHours}h before higher rain risk');
-    final riskColor = predictive == null
-        ? AppColors.textMuted
-        : (predictive!.maxRainProbability >= 60
-              ? AppColors.danger
-              : (predictive!.maxRainProbability >= 40
-                    ? const Color(0xFFF0A63B)
-                    : AppColors.success));
+    final conditionLabel = peakRain >= 70
+        ? 'High rain risk'
+        : (peakRain >= 40 ? 'Rain possible' : 'Good drying window');
 
     return Container(
-      padding: const EdgeInsets.all(14),
+      padding: const EdgeInsets.fromLTRB(14, 14, 14, 14),
       decoration: BoxDecoration(
-        color: Colors.white,
+        gradient: const LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [Color(0xFFFFFFFF), Color(0xFFF6FAFD)],
+        ),
         borderRadius: BorderRadius.circular(12),
         border: Border.all(color: const Color(0xFFD7E0EC)),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.04),
+            blurRadius: 18,
+            offset: const Offset(0, 8),
+          ),
+        ],
+      ),
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final compact = constraints.maxWidth < 340;
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Container(
+                    width: compact ? 48 : 56,
+                    height: compact ? 48 : 56,
+                    decoration: BoxDecoration(
+                      color: rainColor.withValues(alpha: 0.12),
+                      borderRadius: BorderRadius.circular(14),
+                    ),
+                    child: Icon(
+                      predictive == null
+                          ? Icons.cloud_outlined
+                          : (predictive.riskLevel == 'HIGH'
+                                ? Icons.shield_moon_outlined
+                                : Icons.wb_sunny_outlined),
+                      color: rainColor,
+                      size: compact ? 26 : 30,
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'Predictive Drying Decision Support',
+                          style: TextStyle(
+                            fontSize: titleSize,
+                            height: 1,
+                            color: AppColors.textMain,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          target,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            color: AppColors.textMuted,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.end,
+                    children: [
+                      Text(
+                        predictive == null ? 'Syncing' : predictive.riskLevel,
+                        style: TextStyle(
+                          fontSize: compact ? 12 : 13,
+                          fontWeight: FontWeight.w800,
+                          color: rainColor,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        predictive == null
+                            ? 'Waiting'
+                            : '${predictive.dryingScore}/100',
+                        style: TextStyle(
+                          fontSize: compact ? 20 : 24,
+                          height: 1,
+                          fontWeight: FontWeight.w700,
+                          color: AppColors.textMain,
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        'drying score',
+                        style: TextStyle(
+                          fontSize: compact ? 11 : 12,
+                          color: AppColors.textMuted,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+              if (compact) ...[
+                const SizedBox(height: 6),
+                Text(
+                  conditionLabel,
+                  style: const TextStyle(
+                    color: AppColors.textMuted,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ],
+              const SizedBox(height: 12),
+              Text(
+                predictive == null ? statusLine : nextActionLabel,
+                style: TextStyle(
+                  fontSize: bodySize,
+                  color: AppColors.textMuted,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                bestWindowLabel,
+                style: const TextStyle(
+                  color: AppColors.textMain,
+                  fontSize: 22,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              const SizedBox(height: 3),
+              Text(
+                rainRiskLabel,
+                style: const TextStyle(
+                  color: AppColors.primaryDark,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              const SizedBox(height: 10),
+              Row(
+                children: [
+                  Expanded(
+                    child: _PredictiveCompactStat(
+                      label: 'Drying score',
+                      value: dryingScoreLabel,
+                      valueColor: rainColor,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: _PredictiveCompactStat(
+                      label: 'Best drying window',
+                      value: predictive == null
+                          ? '--'
+                          : predictive.bestDryingWindowLabel,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: _PredictiveCompactStat(
+                      label: 'Rain risk',
+                      value: predictive?.riskLevel ?? 'SYNC',
+                      valueColor: rainColor,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 10),
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFF4F8FC),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: const Color(0xFFDDE6F0)),
+                ),
+                child: Text(
+                  recommendationText,
+                  style: TextStyle(
+                    fontSize: bodySize,
+                    color: const Color(0xFF5D6F88),
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+              const SizedBox(height: 10),
+              Row(
+                children: [
+                  Expanded(
+                    child: _PredictiveCompactStat(
+                      label: 'Time left',
+                      value: safeHoursLabel,
+                      detail: safeHoursDetail,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: _PredictiveCompactStat(
+                      label: 'Current rain',
+                      value: '$currentRain%',
+                      valueColor: currentRain >= 60
+                          ? AppColors.danger
+                          : AppColors.success,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: _PredictiveCompactStat(
+                      label: 'Humidity',
+                      value: '${weather?.humidity ?? 0}%',
+                      valueColor: (weather?.humidity ?? 0) >= 75
+                          ? AppColors.danger
+                          : AppColors.textMain,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 14),
+              _PredictiveSunlightCard(
+                title: 'Optimal sunlight',
+                dayLabel: optimalSunlightDayLabel,
+                timeLabel: optimalSunlightTimeLabel,
+                detail: optimalSunlightDetail,
+                accentColor: optimalSunlightWindow == null
+                    ? const Color(0xFF9AA7B8)
+                    : (optimalSunlightWindow?.averageSunlight ?? 0) >= 75
+                    ? AppColors.success
+                    : ((optimalSunlightWindow?.averageSunlight ?? 0) >= 50
+                          ? const Color(0xFFD49B17)
+                          : AppColors.danger),
+                actionLabel: optimalSunlightWindow == null
+                    ? 'No sunny day found'
+                    : 'Dry on this day',
+              ),
+              const SizedBox(height: 14),
+              const _WeatherTab(label: 'Sunlight forecast'),
+              const SizedBox(height: 8),
+              SizedBox(
+                height: 142,
+                child: SingleChildScrollView(
+                  scrollDirection: Axis.horizontal,
+                  child: _WeatherTrendChart(
+                    points: trendPoints,
+                    lineColor: sunlightColor,
+                    emptyLabel: weather == null
+                        ? 'Forecast is still syncing'
+                        : 'No forecast points available',
+                  ),
+                ),
+              ),
+              if (trendPoints.isNotEmpty) ...[
+                const SizedBox(height: 8),
+                SizedBox(
+                  height: 168,
+                  child: ListView.separated(
+                    scrollDirection: Axis.horizontal,
+                    itemCount: trendPoints.length,
+                    separatorBuilder: (context, index) =>
+                        const SizedBox(width: 8),
+                    itemBuilder: (context, index) {
+                      final point = trendPoints[index];
+                      return _ForecastStripTile(
+                        point: point,
+                        icon: _weatherIconForPoint(point),
+                        active: _isWithinBestWindow(
+                          point.time,
+                          bestWindowStart,
+                          bestWindowEnd,
+                        ),
+                        color:
+                            (point.cloudCover ?? 100) <= 25 &&
+                                point.sunlightProbability >= 75
+                            ? AppColors.success
+                            : _sunlightColor(point.sunlightProbability),
+                      );
+                    },
+                  ),
+                ),
+              ],
+            ],
+          );
+        },
+      ),
+    );
+  }
+}
+
+class _PredictiveCompactStat extends StatelessWidget {
+  const _PredictiveCompactStat({
+    required this.label,
+    required this.value,
+    this.detail,
+    this.valueColor = AppColors.textMain,
+  });
+
+  final String label;
+  final String value;
+  final String? detail;
+  final Color valueColor;
+
+  @override
+  Widget build(BuildContext context) {
+    final hasDetail = detail != null && detail!.trim().isNotEmpty;
+    return Container(
+      constraints: BoxConstraints(minHeight: hasDetail ? 86 : 70),
+      padding: const EdgeInsets.all(9),
+      decoration: BoxDecoration(
+        color: const Color(0xFFF8FAFD),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: const Color(0xFFE0E7F1)),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
-            children: [
-              const Icon(Icons.analytics_outlined, color: AppColors.accentBlue),
-              const SizedBox(width: 8),
-              Text(
-                'Forecast Insight',
-                style: TextStyle(
-                  fontSize: headerSize,
-                  fontWeight: FontWeight.w700,
-                  color: AppColors.textMain,
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 8),
           Text(
-            statusLine,
-            style: TextStyle(fontSize: bodySize, color: AppColors.textMuted),
+            label,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              color: AppColors.textMuted,
+              fontSize: 12,
+              fontWeight: FontWeight.w700,
+            ),
           ),
-          if (hasAnalytics) ...[
-            const SizedBox(height: 10),
-            _PredictiveStatRow(
-              label: 'Peak rain',
-              value: '${predictive!.maxRainProbability}% around $peakTimeLabel',
-              valueColor: riskColor,
+          const SizedBox(height: 6),
+          Text(
+            value,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              height: 1.05,
+              fontSize: 14,
+              fontWeight: FontWeight.w700,
+              color: valueColor,
             ),
-            const SizedBox(height: 6),
-            _PredictiveStatRow(
-              label: 'Drying window',
-              value: dryingWindowLabel,
-            ),
-            const SizedBox(height: 6),
-            _PredictiveStatRow(
-              label: 'Risk level',
-              value: predictive!.riskLevel,
-              valueColor: riskColor,
-            ),
-            const SizedBox(height: 8),
+          ),
+          if (hasDetail) ...[
+            const SizedBox(height: 4),
             Text(
-              predictive!.recommendation,
-              style: TextStyle(
-                fontSize: bodySize,
-                color: const Color(0xFF50607A),
+              detail!,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                color: AppColors.textMuted,
+                fontSize: 10.5,
+                height: 1.05,
                 fontWeight: FontWeight.w600,
               ),
             ),
@@ -5700,34 +7735,587 @@ class _PredictiveAnalyticsCard extends StatelessWidget {
   }
 }
 
-class _PredictiveStatRow extends StatelessWidget {
-  const _PredictiveStatRow({
-    required this.label,
-    required this.value,
-    this.valueColor = AppColors.textMain,
+class _PredictiveSunlightCard extends StatelessWidget {
+  const _PredictiveSunlightCard({
+    required this.title,
+    required this.dayLabel,
+    required this.timeLabel,
+    required this.detail,
+    required this.accentColor,
+    required this.actionLabel,
   });
 
-  final String label;
-  final String value;
-  final Color valueColor;
+  final String title;
+  final String dayLabel;
+  final String timeLabel;
+  final String detail;
+  final Color accentColor;
+  final String actionLabel;
 
   @override
   Widget build(BuildContext context) {
-    return Row(
-      children: [
-        Expanded(
-          child: Text(
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.fromLTRB(12, 12, 12, 11),
+      decoration: BoxDecoration(
+        color: const Color(0xFFF7FAFC),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: const Color(0xFFDCE4F0)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.wb_sunny_outlined, color: accentColor, size: 18),
+              const SizedBox(width: 6),
+              Expanded(
+                child: Text(
+                  title,
+                  style: const TextStyle(
+                    color: AppColors.textMain,
+                    fontSize: 14,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+              ),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                decoration: BoxDecoration(
+                  color: accentColor.withValues(alpha: 0.12),
+                  borderRadius: BorderRadius.circular(999),
+                ),
+                child: Text(
+                  'Best period',
+                  style: TextStyle(
+                    color: accentColor,
+                    fontSize: 10,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          Text(
+            dayLabel,
+            style: const TextStyle(
+              color: AppColors.textMain,
+              fontSize: 15,
+              height: 1.05,
+              fontWeight: FontWeight.w800,
+            ),
+          ),
+          const SizedBox(height: 2),
+          Text(
+            timeLabel,
+            style: TextStyle(
+              color: accentColor,
+              fontSize: 18,
+              height: 1.05,
+              fontWeight: FontWeight.w800,
+            ),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            detail,
+            style: const TextStyle(
+              color: AppColors.textMuted,
+              fontSize: 12.5,
+              height: 1.1,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            'Next action: $actionLabel',
+            style: TextStyle(
+              color: accentColor,
+              fontSize: 11.5,
+              height: 1.05,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _WeatherTab extends StatelessWidget {
+  const _WeatherTab({required this.label});
+
+  final String label;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(right: 14),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
             label,
-            style: const TextStyle(color: AppColors.textMuted),
+            style: const TextStyle(
+              color: AppColors.textMain,
+              fontSize: 14,
+              fontWeight: FontWeight.w800,
+            ),
+          ),
+          const SizedBox(height: 4),
+          const SizedBox(
+            height: 3,
+            width: 88,
+            child: ColoredBox(color: Color(0xFFF4BE00)),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ForecastStripTile extends StatelessWidget {
+  const _ForecastStripTile({
+    required this.point,
+    required this.icon,
+    required this.color,
+    required this.active,
+  });
+
+  final _WeatherTrendPoint point;
+  final IconData icon;
+  final Color color;
+  final bool active;
+
+  @override
+  Widget build(BuildContext context) {
+    final tempF = point.temperatureC == null
+        ? null
+        : ((point.temperatureC! * 9 / 5) + 32).round();
+    return Container(
+      width: 112,
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 7),
+      decoration: BoxDecoration(
+        color: active ? const Color(0xFFE9EDF5) : const Color(0xFFF8FAFD),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(
+          color: active ? const Color(0xFFD2DAE8) : const Color(0xFFE3E9F2),
+        ),
+      ),
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Text(
+            _compactForecastLabel(point.time),
+            textAlign: TextAlign.center,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              color: AppColors.textMuted,
+              fontSize: 9,
+              height: 1.02,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          Text(
+            _compactForecastTimeRange(point.time, point.endTime),
+            textAlign: TextAlign.center,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              color: AppColors.textMain,
+              fontSize: 10,
+              height: 1,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          Text(
+            _sunlightLabel(point),
+            textAlign: TextAlign.center,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              color: AppColors.textMuted,
+              fontSize: 9,
+              height: 1,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          Icon(icon, color: color, size: 21),
+          Text(
+            tempF == null ? '${point.sunlightProbability}%' : '$tempF°',
+            style: const TextStyle(
+              color: AppColors.textMain,
+              fontSize: 12,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          Text(
+            '${point.sunlightProbability}%',
+            style: const TextStyle(
+              color: AppColors.textMuted,
+              fontSize: 11,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  String _compactForecastLabel(DateTime time) {
+    const days = <String>['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+    const months = <String>[
+      'Jan',
+      'Feb',
+      'Mar',
+      'Apr',
+      'May',
+      'Jun',
+      'Jul',
+      'Aug',
+      'Sep',
+      'Oct',
+      'Nov',
+      'Dec',
+    ];
+    return '${days[time.weekday - 1]}, ${months[time.month - 1]} ${time.day}';
+  }
+
+  String _compactForecastTimeRange(DateTime start, DateTime end) {
+    return '${_shortClockTime(start)} - ${_shortClockTime(end)}';
+  }
+
+  String _shortClockTime(DateTime time) {
+    final hour = time.hour % 12 == 0 ? 12 : time.hour % 12;
+    final meridian = time.hour >= 12 ? 'PM' : 'AM';
+    return '$hour $meridian';
+  }
+
+  String _sunlightLabel(_WeatherTrendPoint point) {
+    if ((point.cloudCover ?? 100) <= 25 && point.sunlightProbability >= 75) {
+      return 'Best sunlight';
+    }
+    if ((point.cloudCover ?? 100) <= 55 || point.sunlightProbability >= 45) {
+      return 'Partial sun';
+    }
+    return 'Low sun';
+  }
+
+  _WeeklySunlightWindow? _weeklySunlightWindow(
+    List<_WeatherTrendPoint> points,
+  ) {
+    if (points.isEmpty) {
+      return null;
+    }
+
+    final now = DateTime.now();
+    final horizonEnd = now.add(const Duration(days: 7));
+    final horizon =
+        points
+            .where(
+              (point) =>
+                  !point.time.isBefore(
+                    now.subtract(const Duration(minutes: 1)),
+                  ) &&
+                  point.time.isBefore(horizonEnd),
+            )
+            .toList()
+          ..sort((a, b) => a.time.compareTo(b.time));
+
+    if (horizon.isEmpty) {
+      return null;
+    }
+
+    final dayBuckets = <DateTime, List<_WeatherTrendPoint>>{};
+    for (final point in horizon) {
+      final dayKey = DateTime(
+        point.time.year,
+        point.time.month,
+        point.time.day,
+      );
+      dayBuckets.putIfAbsent(dayKey, () => <_WeatherTrendPoint>[]).add(point);
+    }
+
+    _WeeklySunlightWindow? best;
+    for (final entry in dayBuckets.entries) {
+      final dayPoints = entry.value..sort((a, b) => a.time.compareTo(b.time));
+      if (dayPoints.isEmpty) {
+        continue;
+      }
+
+      final dayBest = _findBestSunWindow(dayPoints);
+      if (dayBest == null) {
+        continue;
+      }
+
+      final candidate = _WeeklySunlightWindow(
+        dayStart: entry.key,
+        windowStart: dayPoints[dayBest.startIndex].time,
+        windowEnd: dayPoints[dayBest.endIndex].endTime,
+        averageSunlight: dayBest.averageScore,
+        windowPoints: dayBest.endIndex - dayBest.startIndex + 1,
+        totalDayPoints: dayPoints.length,
+      );
+
+      if (best == null ||
+          candidate.averageSunlight > best.averageSunlight ||
+          (candidate.averageSunlight == best.averageSunlight &&
+              candidate.dayStart.isBefore(best.dayStart))) {
+        best = candidate;
+      }
+    }
+
+    if (best == null || !best.hasClearBestWindow) {
+      return null;
+    }
+
+    return best;
+  }
+
+  ({int startIndex, int endIndex, double averageScore})? _findBestSunWindow(
+    List<_WeatherTrendPoint> points,
+  ) {
+    if (points.isEmpty) {
+      return null;
+    }
+
+    final maxWindowPoints = points.length >= 4 ? 4 : points.length;
+    final minWindowPoints = points.length >= 3 ? 2 : 1;
+    ({int startIndex, int endIndex, double averageScore})? best;
+
+    for (var length = maxWindowPoints; length >= minWindowPoints; length--) {
+      for (var start = 0; start + length <= points.length; start++) {
+        final end = start + length - 1;
+        final slice = points.sublist(start, end + 1);
+        final averageScore =
+            slice.fold<double>(
+              0,
+              (sum, point) => sum + point.sunlightProbability,
+            ) /
+            slice.length;
+        final candidate = (
+          startIndex: start,
+          endIndex: end,
+          averageScore: averageScore,
+        );
+
+        if (best == null ||
+            candidate.averageScore > best.averageScore ||
+            (candidate.averageScore == best.averageScore &&
+                start < best.startIndex)) {
+          best = candidate;
+        }
+      }
+
+      if (best != null) {
+        break;
+      }
+    }
+
+    if (best == null || best.averageScore < 55) {
+      return null;
+    }
+
+    return best;
+  }
+}
+
+class _WeeklySunlightWindow {
+  const _WeeklySunlightWindow({
+    required this.dayStart,
+    required this.windowStart,
+    required this.windowEnd,
+    required this.averageSunlight,
+    required this.windowPoints,
+    required this.totalDayPoints,
+  });
+
+  final DateTime dayStart;
+  final DateTime windowStart;
+  final DateTime windowEnd;
+  final double averageSunlight;
+  final int windowPoints;
+  final int totalDayPoints;
+
+  bool get hasClearBestWindow =>
+      windowPoints > 0 && windowPoints < totalDayPoints;
+
+  String get dayLabel => formatForecastDayDate(dayStart);
+  String get timeLabel => 'Next sunny day';
+}
+
+class _WeatherTrendPoint {
+  const _WeatherTrendPoint({
+    required this.time,
+    required this.endTime,
+    required this.rainProbability,
+    this.temperatureC,
+    this.cloudCover,
+  });
+
+  final DateTime time;
+  final DateTime endTime;
+  final int rainProbability;
+  final double? temperatureC;
+  final int? cloudCover;
+
+  int get sunlightProbability {
+    final rainSunlight = 100 - rainProbability;
+    final cloudSunlight = cloudCover == null
+        ? rainSunlight
+        : 100 - cloudCover!.clamp(0, 100);
+    return ((rainSunlight * 0.45) + (cloudSunlight * 0.55)).round().clamp(
+      0,
+      100,
+    );
+  }
+}
+
+class _WeatherTrendChart extends StatelessWidget {
+  const _WeatherTrendChart({
+    required this.points,
+    required this.lineColor,
+    required this.emptyLabel,
+  });
+
+  final List<_WeatherTrendPoint> points;
+  final Color lineColor;
+  final String emptyLabel;
+
+  @override
+  Widget build(BuildContext context) {
+    if (points.isEmpty) {
+      return SizedBox(
+        width: MediaQuery.sizeOf(context).width - 56,
+        child: Center(
+          child: Text(
+            emptyLabel,
+            style: const TextStyle(
+              color: AppColors.textMuted,
+              fontWeight: FontWeight.w700,
+            ),
           ),
         ),
-        const SizedBox(width: 8),
-        Text(
-          value,
-          style: TextStyle(fontWeight: FontWeight.w700, color: valueColor),
-        ),
-      ],
+      );
+    }
+
+    final chartWidth = math.max(
+      MediaQuery.sizeOf(context).width - 56,
+      points.length * 136.0,
     );
+
+    return SizedBox(
+      width: chartWidth,
+      height: 142,
+      child: CustomPaint(
+        painter: _WeatherTrendPainter(points: points, lineColor: lineColor),
+      ),
+    );
+  }
+}
+
+class _WeatherTrendPainter extends CustomPainter {
+  const _WeatherTrendPainter({required this.points, required this.lineColor});
+
+  final List<_WeatherTrendPoint> points;
+  final Color lineColor;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final chartTop = 14.0;
+    final chartBottom = size.height - 52;
+    final chartHeight = chartBottom - chartTop;
+    final stepX = points.length == 1 ? 0.0 : size.width / (points.length - 1);
+    final path = Path();
+    final fillPath = Path();
+    final labelPainter = TextPainter(textDirection: TextDirection.ltr);
+    final coordinates = <Offset>[];
+
+    for (var i = 0; i < points.length; i++) {
+      final value = points[i].sunlightProbability.clamp(0, 100);
+      final x = points.length == 1 ? size.width / 2 : stepX * i;
+      final y = chartBottom - ((value / 100) * chartHeight);
+      final offset = Offset(x, y);
+      coordinates.add(offset);
+      if (i == 0) {
+        path.moveTo(x, y);
+        fillPath.moveTo(x, chartBottom);
+        fillPath.lineTo(x, y);
+      } else {
+        path.lineTo(x, y);
+        fillPath.lineTo(x, y);
+      }
+    }
+
+    fillPath.lineTo(coordinates.last.dx, chartBottom);
+    fillPath.close();
+
+    canvas.drawPath(
+      fillPath,
+      Paint()..color = lineColor.withValues(alpha: 0.18),
+    );
+    canvas.drawPath(
+      path,
+      Paint()
+        ..color = lineColor
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2.4
+        ..strokeCap = StrokeCap.round
+        ..strokeJoin = StrokeJoin.round,
+    );
+
+    for (var i = 0; i < points.length; i++) {
+      final offset = coordinates[i];
+      final sunText = '${points[i].sunlightProbability}%';
+      labelPainter.text = TextSpan(
+        text: sunText,
+        style: const TextStyle(
+          color: Color(0xFF75829A),
+          fontSize: 11,
+          fontWeight: FontWeight.w800,
+        ),
+      );
+      labelPainter.layout();
+      labelPainter.paint(
+        canvas,
+        Offset(
+          (offset.dx - labelPainter.width / 2).clamp(
+            0,
+            size.width - labelPainter.width,
+          ),
+          (offset.dy - 20).clamp(0, chartBottom - 18),
+        ),
+      );
+
+      labelPainter.text = TextSpan(
+        text:
+            '${formatForecastDayDate(points[i].time)}\n${formatForecastWindow(points[i].time, points[i].endTime)}',
+        style: const TextStyle(
+          color: AppColors.textMuted,
+          fontSize: 9,
+          height: 1,
+          fontWeight: FontWeight.w700,
+        ),
+      );
+      labelPainter.textAlign = TextAlign.center;
+      labelPainter.layout();
+      labelPainter.paint(
+        canvas,
+        Offset(
+          (offset.dx - labelPainter.width / 2).clamp(
+            0,
+            size.width - labelPainter.width,
+          ),
+          size.height - 38,
+        ),
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _WeatherTrendPainter oldDelegate) {
+    return oldDelegate.points != points || oldDelegate.lineColor != lineColor;
   }
 }
 
@@ -5820,8 +8408,11 @@ class _SensorTile extends StatelessWidget {
     final titleSize = rs(context, 24, min: 18);
     final valueSize = rs(context, 24, min: 17);
 
-    const Color dotColor = Color(0xFF2DB367);
-    const Color readColor = AppColors.primary;
+    final isOnline = status == 'Online';
+    final dotColor = isOnline ? const Color(0xFF2DB367) : AppColors.textMuted;
+    final readColor = reading == '--' || reading == 'Unknown'
+        ? AppColors.textMuted
+        : AppColors.primary;
 
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
@@ -5865,24 +8456,37 @@ class _SensorTile extends StatelessWidget {
                       ),
                     ),
                     const SizedBox(width: 6),
-                    Text(
-                      status,
-                      style: const TextStyle(color: Color(0xFF7888A1)),
+                    Flexible(
+                      child: Text(
+                        status,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(color: Color(0xFF7888A1)),
+                      ),
                     ),
                   ],
                 ),
               ],
             ),
           ),
-          Column(
-            crossAxisAlignment: CrossAxisAlignment.end,
-            children: [
-              Text(time, style: const TextStyle(color: Color(0xFF9BA8BE))),
-              Text(
-                reading,
-                style: TextStyle(fontSize: valueSize, color: readColor),
-              ),
-            ],
+          Flexible(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.end,
+              children: [
+                Text(
+                  time,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(color: Color(0xFF9BA8BE)),
+                ),
+                Text(
+                  reading,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(fontSize: valueSize, color: readColor),
+                ),
+              ],
+            ),
           ),
         ],
       ),
@@ -5903,7 +8507,7 @@ class _InfoStatCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final valueSize = rs(context, 34, min: 24);
+    final valueSize = rs(context, 26, min: 20);
 
     return Container(
       padding: const EdgeInsets.all(14),
@@ -5917,9 +8521,16 @@ class _InfoStatCard extends StatelessWidget {
         children: [
           Icon(icon, color: AppColors.primary),
           const SizedBox(height: 10),
-          Text(title, style: const TextStyle(color: Color(0xFF667A98))),
+          Text(
+            title,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(color: Color(0xFF667A98)),
+          ),
           Text(
             value,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
             style: TextStyle(
               fontSize: valueSize,
               color: AppColors.textMain,
@@ -5939,6 +8550,7 @@ class _AlertTile extends StatelessWidget {
     required this.title,
     required this.body,
     required this.time,
+    required this.isRead,
     this.rightLabel,
   });
 
@@ -5947,6 +8559,7 @@ class _AlertTile extends StatelessWidget {
   final String title;
   final String body;
   final String time;
+  final bool isRead;
   final String? rightLabel;
 
   @override
@@ -5978,7 +8591,7 @@ class _AlertTile extends StatelessWidget {
                   style: TextStyle(
                     fontSize: titleSize,
                     fontWeight: FontWeight.w700,
-                    color: AppColors.textMain,
+                    color: isRead ? AppColors.textMuted : AppColors.textMain,
                   ),
                 ),
                 const SizedBox(height: 4),
@@ -6151,121 +8764,13 @@ class _SafetyRow extends StatelessWidget {
   Widget build(BuildContext context) {
     return Row(
       children: [
-        const Icon(Icons.check_circle, size: 16, color: Color(0xFF6ACEA1)),
+        const Icon(Icons.circle_outlined, size: 16, color: Color(0xFF6ACEA1)),
         const SizedBox(width: 8),
         Text(
           text,
           style: const TextStyle(fontSize: 16, color: Color(0xFF566A86)),
         ),
       ],
-    );
-  }
-}
-
-class _ConsoleActionButton extends StatelessWidget {
-  const _ConsoleActionButton({
-    required this.title,
-    required this.icon,
-    this.onTap,
-    this.darkIcon = false,
-  });
-
-  final String title;
-  final IconData icon;
-  final VoidCallback? onTap;
-  final bool darkIcon;
-
-  @override
-  Widget build(BuildContext context) {
-    return InkWell(
-      onTap: onTap,
-      borderRadius: BorderRadius.circular(8),
-      child: Container(
-        height: 132,
-        padding: const EdgeInsets.all(14),
-        decoration: BoxDecoration(
-          color: Colors.white,
-          borderRadius: BorderRadius.circular(8),
-          border: Border.all(color: const Color(0xFFD9E1EC)),
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black.withValues(alpha: 0.05),
-              blurRadius: 14,
-              offset: const Offset(0, 6),
-            ),
-          ],
-        ),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            CircleAvatar(
-              radius: 20,
-              backgroundColor: const Color(0xFFEAF3F2),
-              child: Icon(
-                icon,
-                color: darkIcon ? const Color(0xFF70839F) : AppColors.primary,
-              ),
-            ),
-            const SizedBox(height: 14),
-            Text(
-              title,
-              textAlign: TextAlign.center,
-              style: const TextStyle(
-                fontSize: 16,
-                color: AppColors.textMain,
-                fontWeight: FontWeight.w700,
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _FilterChipActive extends StatelessWidget {
-  const _FilterChipActive({required this.label});
-
-  final String label;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      width: 42,
-      height: 42,
-      decoration: const BoxDecoration(
-        color: AppColors.primary,
-        shape: BoxShape.circle,
-      ),
-      alignment: Alignment.center,
-      child: Text(
-        label,
-        textAlign: TextAlign.center,
-        style: const TextStyle(
-          fontSize: 10,
-          color: Colors.white,
-          fontWeight: FontWeight.w700,
-        ),
-      ),
-    );
-  }
-}
-
-class _FilterChipMute extends StatelessWidget {
-  const _FilterChipMute({required this.label});
-
-  final String label;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(20),
-        border: Border.all(color: const Color(0xFFD8E1EC)),
-      ),
-      child: Text(label, style: const TextStyle(color: Color(0xFF5E6F89))),
     );
   }
 }

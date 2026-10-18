@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
-	<string>Sun-Dry Mobile</string>
+	<string>SILONG Mobile</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -13,7 +13,7 @@
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>aegis_dry_mobile</string>
+	<string>SILONG</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string>Location helps auto-select the daing/tuyo drying site and fetch accurate weather.</string>
 	<key>CFBundlePackageType</key>
